@@ -3,16 +3,23 @@
     python src/live/run.py --once                  decide on the latest closed bar, no orders
     python src/live/run.py --loop                  keep running on the 4h boundary
     python src/live/run.py --mode paper --loop     live data, simulated fills (stage 2)
+    python src/live/run.py --mode paper --loop --until 2026-10-10T12:00Z   stop on a date
     python src/live/run.py --mode paper --report   what paper mode has measured so far
     python src/live/run.py --mode live --loop      real orders (needs LIGHTER_API_PRIVATE_KEY)
 
 Paper mode runs two clocks, like production: decisions on the 4h boundary, and a
 fast poll in between that checks resting stops against the MARK price — the
 trigger basis Lighter actually uses, which the backtest does not model.
+
+--until takes an ABSOLUTE instant rather than a duration on purpose. A multi-week
+run gets restarted — reboots, dropped links, a supervisor — and a duration would
+restart its clock every time, so the run would never end. State survives restarts
+either way: last_bar_ms makes reprocessing a bar a no-op.
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import sys
 import time
 from pathlib import Path
@@ -224,6 +231,16 @@ def next_boundary(now_ms: int) -> int:
     return (now_ms // H4 + 1) * H4
 
 
+def parse_until(text: str) -> float:
+    """ISO 8601 instant -> unix seconds. Naive input is read as UTC, because every
+    other clock in this system is UTC and a silent local-time reading would end a
+    multi-week run hours early or late."""
+    t = dt.datetime.fromisoformat(text.replace('Z', '+00:00'))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.timestamp()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--config')
@@ -232,6 +249,8 @@ def main() -> int:
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--loop', action='store_true')
     ap.add_argument('--report', action='store_true')
+    ap.add_argument('--until', help='stop the loop at this UTC instant '
+                                    '(ISO 8601, e.g. 2026-10-10T12:00Z)')
     ap.add_argument('--depth-scan', action='store_true', dest='depth_scan')
     ap.add_argument('--capacity', action='store_true')
     ap.add_argument('--equity', type=float, default=100_000.)
@@ -271,16 +290,35 @@ def main() -> int:
         run_once(trader, markets, config)
         return 0
 
-    while True:
-        target = next_boundary(int(time.time() * 1000))
-        # Let the venue publish the closed bar before acting on it.
-        wake = target / 1000 + config.bar_grace_seconds / 4
-        poll_until(trader, wake, config)
+    deadline = parse_until(a.until) if a.until else float('inf')
+    if a.until:
+        left = (deadline - time.time()) / 86400
+        print(f'running until {a.until} ({left:.1f} days)', flush=True)
+
+    # Catch up before sleeping. On a restart the just-closed bar may still be
+    # unprocessed, and waiting for the next boundary would drop it; if it was
+    # already handled, last_bar_ms makes this a no-op and the freshness guard
+    # rejects anything older than one interval.
+    first = True
+    while time.time() < deadline:
+        if not first:
+            target = next_boundary(int(time.time() * 1000))
+            # Let the venue publish the closed bar before acting on it.
+            wake = min(target / 1000 + config.bar_grace_seconds / 4, deadline)
+            poll_until(trader, wake, config)
+            if time.time() >= deadline:
+                break
+        first = False
         try:
             run_once(trader, markets, config)
         except Exception as exc:
             trader.journal.append('bar_error', error=str(exc))
             print(f'   ERROR {exc}', file=sys.stderr)
+
+    trader.journal.append('stop', reason='until reached')
+    print(f'\nreached {a.until} — run complete\n', flush=True)
+    report(trader)
+    return 0
 
 
 if __name__ == '__main__':

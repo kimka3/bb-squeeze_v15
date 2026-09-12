@@ -516,5 +516,92 @@ class ConfigSafety(unittest.TestCase):
         self.assertEqual(LiveConfig().mode, 'shadow')
 
 
+class MultiWeekRun(unittest.TestCase):
+    """What a 4-week unattended run depends on, as opposed to a 4-hour one."""
+
+    def test_restricted_host_is_abandoned_not_retried(self):
+        """A 451 must cost one attempt, not the whole backoff budget.
+
+        Retrying a host that is refusing by policy burns 2+4+8+16s before the
+        reachable host is ever tried — and does it on every bar, forever.
+        """
+        import urllib.error
+        from live import feed
+
+        calls = []
+
+        def fake_urlopen(url, timeout=None):
+            calls.append(url)
+            if 'fapi.binance.com' in url:
+                raise urllib.error.HTTPError(url, 451, 'Unavailable', {}, None)
+            raise AssertionError('should not reach the network in a test')
+
+        real_open, real_sleep = feed.urllib.request.urlopen, feed.time.sleep
+        feed.urllib.request.urlopen = fake_urlopen
+        feed.time.sleep = lambda _: None
+        try:
+            with self.assertRaises(RuntimeError):
+                feed._klines_raw('BTCUSDT', '4h', 10, 5, retries=4)
+        finally:
+            feed.urllib.request.urlopen, feed.time.sleep = real_open, real_sleep
+
+        restricted = [u for u in calls if 'fapi.binance.com' in u]
+        self.assertEqual(len(restricted), 1, 'the 451 host was retried')
+        self.assertTrue(any('www.binance.com' in u for u in calls),
+                        'the fallback host was never tried')
+
+    def test_flake_is_retried_on_the_same_host(self):
+        from live import feed
+
+        calls = []
+
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'[[1,"1","1","1","1","1"]]'
+
+        def fake_urlopen(url, timeout=None):
+            calls.append(url)
+            if len(calls) == 1:
+                raise OSError('connection reset')
+            return Resp()
+
+        real_open, real_sleep = feed.urllib.request.urlopen, feed.time.sleep
+        feed.urllib.request.urlopen = fake_urlopen
+        feed.time.sleep = lambda _: None
+        try:
+            rows = feed._klines_raw('BTCUSDT', '4h', 10, 5, retries=4)
+        finally:
+            feed.urllib.request.urlopen, feed.time.sleep = real_open, real_sleep
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all('fapi.binance.com' in u for u in calls),
+                        'a flake should not move hosts')
+
+    def test_until_is_read_as_utc(self):
+        """A naive timestamp read as local time ends a multi-week run hours off."""
+        from live.run import parse_until
+        self.assertEqual(parse_until('2026-10-10T12:00:00Z'),
+                         parse_until('2026-10-10T12:00:00'))
+        self.assertEqual(parse_until('2026-10-10T12:00:00Z'),
+                         parse_until('2026-10-10T14:00:00+02:00'))
+
+    def test_reprocessing_a_bar_is_a_no_op_with_real_equity(self):
+        """Restarts re-offer the handled bar; it must not trade, and must not
+        report a placeholder zero that reads like a wiped account."""
+        cfg = LiveConfig()
+        broker = DryRunBroker()
+        trader = Trader(cfg, broker, fake_markets(), Journal(Path('/tmp')))
+        trader.last_bar_ms = START + 10 * H4
+
+        out = trader.on_bar(START + 10 * H4, {}, {})
+
+        self.assertEqual(out.entries, [])
+        self.assertEqual(out.equity, broker.account_state().equity)
+        self.assertGreater(out.equity, 0)
+        self.assertIn('already processed', out.reasons[0])
+
+
 if __name__ == '__main__':
     unittest.main()

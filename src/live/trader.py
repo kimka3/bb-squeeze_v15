@@ -129,13 +129,17 @@ class Trader:
 
         now_ms is injectable so a replay can drive this over historical bars.
         """
+        state = self.broker.account_state()
         if bar_ms <= self.last_bar_ms:
-            return BarOutcome(bar_ms, 0.0, reasons=[f'bar {bar_ms} already processed'])
+            # A restart re-offers the bar it already handled. Report the real
+            # equity anyway: over a multi-week run a human reads these lines, and
+            # a placeholder zero here looks exactly like a wiped account.
+            return BarOutcome(bar_ms, state.equity,
+                              reasons=[f'bar {bar_ms} already processed'])
         # bar_ms is the bar that just CLOSED and produced the signals; fills land
         # in the bar now opening. The backtest stamps trades with the entry bar.
         entry_ms = bar_ms + H4
 
-        state = self.broker.account_state()
         out = BarOutcome(bar_ms, state.equity)
 
         fresh = guards.check_bar_freshness(bar_ms, self.config, now_ms)
