@@ -1,5 +1,5 @@
 {
-  ".gitignore": "c96e388505b0ddac6cb18de5ef330ab1f91d3350e2c561e21b6f655462d9b84e",
+  ".gitignore": "c8ead4cf0400e4788b0812ff67bc9fad7282720164efe8e5cf2dacb5f4766f2e",
   "README.md": "633004de6838687864ef59ebe98cd4b86511ad50443b3f1ac7ec2e354668891a",
   "data/jobs_risk_sweep.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "data/micro/ADAUSDT_1623456000000.json": "93bbbb553df74c5006f00bc4819edcd8f3dc9dc1daaa63343bcd27d04fd79723",
@@ -795,7 +795,6 @@
   "data/micro/robust_SOLUSDT_1633507200000.json": "ad1b8b70ecaa35f2c4da9ca98320b45eb8cf2a513ff18218ff24cbda0b153a68",
   "data/micro/robust_SOLUSDT_1691985600000.json": "66768ad32d642563a57132292aee8a2c59d13666aa91bf8696fe7f58d28fa06e",
   "data/micro/robust_SOLUSDT_1752552000000.json": "c5347f4ae444c740733ddd2f081d915a1ffe704223dc2e94e51294ffc7fd46dc",
-  "data/prepared.pkl": "b0864fc62593187d5f81cee0bbfc22489592446883ec3c5fd8fc941804cd1918",
   "data/raw/ADAUSDT_1604188800000_4h.json": "e29b3967884c903541cfb1bee7f337bfce9bdf3f64f4d85e0fc6e1ebed9fd566",
   "data/raw/ADAUSDT_1604188800000_mark4h.json": "c66dbecf3c00f509e63e9e826caf595789d7fa492c85ea2c404336135021a67d",
   "data/raw/ADAUSDT_1609459200000_funding.json": "1269a0642e9b973249fa28457ab7dcdf1163079ddc2aa7812febc40ef20fcdfb",
@@ -1094,7 +1093,7 @@
   "data/raw/XRPUSDT_1785628800000_4h.json": "0a4cb94d9e07b44e5bb0af966e1643459d9a63e2adc06d3ef6e4ab520fd89488",
   "data/raw/XRPUSDT_1785628800000_mark4h.json": "7c7c2ef73a45a68951a2ae8e178594011b8a036b027d0041c8f38a9f1956f262",
   "docs/bb_squeeze_A_risk_comparison.md": "49a9f342654f220586df5272844c6634757f3912759111e6291f32f36cbc1385",
-  "docs/live-architecture.md": "58ae3fb52f158e1019bbd5b846e12fac079e9e3018b613227a5a3481ff7905f0",
+  "docs/live-architecture.md": "d19ccdab40d55d83910491ae883d74b23141dd48d65f4f5fc407112606170b8b",
   "live.config.example.json": "9d903a199ff99d967cabf04254e73c9640f391ea22509ceeda2f210a197854de",
   "reference/binance_risk200.json": "0b07d56fc7370336c27f5b63e96201cc1e90b0b5a8c456539c8b31a3f73fa8f1",
   "reference/binance_slip5_risk200.json": "48371eec753371c1e2a8155824542a267ce77c070e180393d51da2889ce16c7e",
@@ -1168,7 +1167,7 @@
   "src/live/guards.py": "fcdfbd915da5c41f75226e4dc6383bf54ce51e2ccce2220422ce719c7892e9b1",
   "src/live/journal.py": "f4ef6b2e31f840647cce78ba6198871ddb0275b5ac22f72afa3573c8f6f17ead",
   "src/live/markets.py": "79a68d3b8bac48b7f897445c42026f45c61735f4bb3fe7687594f5b5eb5ceb6a",
-  "src/live/replay.py": "6435c8809ada42acd4ff68ba4e38501202649ab16262674d2dc49e282f9726a3",
+  "src/live/replay.py": "fe26fb176b9c5c8a7f09e3adcb2fbe4367de0fd332bfc7c2ace67e4c03f87085",
   "src/live/run.py": "4e13515a064c05c79b71c0595d4afdd3937730c1d9fecb466ec24473cf667b5a",
   "src/live/trader.py": "7ecf7588016478788bc25b5bfabe41650b62210f43af36418c4f3ea3f6e4292d",
   "src/live_core.py": "0d7c05f8eab1e02e4660aad90b4e042a81854d3d22e5da3741d0ccea4ac47751",
@@ -1177,5 +1176,5 @@
   "src/run_frontier.py": "c6fbc15c05f1ad671947e64df29820fa79a774fd7c1942bf71325ef45f61d4d3",
   "src/trade_core.py": "394a715da7f4a6a338dff53bf3480a10325e2c49954068f9842967937c34f4e0",
   "tests/test_caps.py": "067cde9ae6bb66101bf4934ce26531331116b8ab6e966bcffece6cf4b40db51a",
-  "tests/test_live.py": "6e006c4b219f18477131cd81c702a128134b8b79ebd8f372769b7fb83a730370"
+  "tests/test_live.py": "3c771ac7aacd6679fbac59af5e6432abf3e125408ec51fb857096f56699fcb2d"
 }

@@ -171,6 +171,57 @@ class ProtectiveOrders(unittest.TestCase):
             self.assertFalse([o for o in broker.log if o['op'] == 'modify'])
 
 
+class ReplayBrokerFidelity(unittest.TestCase):
+    """The replay broker stands in for the exchange in the stage 1 gate. A bug
+    here corrupts the gate itself, so its order bookkeeping is tested directly."""
+
+    def _broker(self):
+        from live.replay import ReplayBroker
+        return ReplayBroker(market=None, config=Strategy(fee=0., slippage=0., funding=False))
+
+    def test_stop_amend_moves_only_its_own_position(self):
+        """A trailing amend for one symbol must not touch any other.
+
+        This regression is why the stage 1 sizing gate failed: modify_stop fell
+        through to a fallback that wrote the trigger onto every open position,
+        cross-contaminating stops between symbols and producing exits at levels
+        no strategy rule had asked for.
+        """
+        broker = self._broker()
+        markets = fake_markets()
+        for symbol, trigger in (('ETHUSDT', 110.), ('BTCUSDT', 220.)):
+            broker.market_order(markets[symbol], symbol, 'SHORT', 1., False, 1, 100.)
+            broker.place_stop(markets[symbol], symbol, 'SHORT', 1., trigger, 1)
+        eth_ref = [r for i, r in broker._owner.items() if r == 'ETHUSDT'][0]
+        eth_index = [i for i, r in broker._owner.items() if r == 'ETHUSDT'][0]
+
+        from live.broker import OrderRef
+        broker.modify_stop(markets['ETHUSDT'], OrderRef(1, eth_index, 'SL'), 1., 105.)
+
+        self.assertEqual(broker.book['ETHUSDT']['stop'], 105.)
+        self.assertEqual(broker.book['BTCUSDT']['stop'], 220.,
+                         'amending one stop must leave every other position alone')
+
+    def test_unattributable_amend_raises_rather_than_guessing(self):
+        broker = self._broker()
+        markets = fake_markets()
+        broker.market_order(markets['ETHUSDT'], 'ETHUSDT', 'SHORT', 1., False, 1, 100.)
+        broker.place_stop(markets['ETHUSDT'], 'ETHUSDT', 'SHORT', 1., 110., 1)
+        from live.broker import OrderRef
+        with self.assertRaises(KeyError):
+            broker.modify_stop(markets['ETHUSDT'], OrderRef(9, 9999, 'SL'), 1., 105.)
+
+    def test_entry_is_marked_at_mark_not_fill_price(self):
+        """Slippage shows as unrealised loss the instant the position opens, so
+        the next entry in the same bar sizes against the smaller account."""
+        broker = self._broker()
+        markets = fake_markets()
+        broker.mark({'ETHUSDT': 100.})
+        broker.market_order(markets['ETHUSDT'], 'ETHUSDT', 'SHORT', 10., False, 1, 99.98)
+        self.assertEqual(broker.book['ETHUSDT']['last'], 100.)
+        self.assertAlmostEqual(broker.equity(), 100_000. - 0.2, places=9)
+
+
 class Idempotency(unittest.TestCase):
     def test_client_order_index_is_deterministic_and_in_range(self):
         a = client_order_index(START, 'BTCUSDT', 'ENTRY')
