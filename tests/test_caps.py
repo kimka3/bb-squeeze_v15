@@ -54,4 +54,47 @@ class RiskTests(unittest.TestCase):
         for kw in [{'risk':.0201},{'risk':.02,'total_risk':.061},{'risk':.02,'gross_cap':5.1},{'risk':.02,'max_positions':7}]:
             with self.assertRaises(ValueError):Strategy(**kw)
 
+
+class CostOverrides(unittest.TestCase):
+    """The two optional cost hooks, and that neither disturbs the default path."""
+
+    def base(self):
+        return Strategy(short_btc_bull_risk=.5, fee=0., slippage=.0002, funding=False)
+
+    def test_default_path_ignores_both_hooks(self):
+        plain = run(fixture(('ETHUSDT',)), self.base(), START, START + 3 * H4)
+        for kw in ({'slippage_by_symbol': None}, {'slippage_of': None}):
+            other = run(fixture(('ETHUSDT',)), self.base(), START, START + 3 * H4, **kw)
+            self.assertEqual(other['metrics']['final_equity'],
+                             plain['metrics']['final_equity'])
+
+    def test_slippage_of_is_priced_at_the_equity_the_account_actually_has(self):
+        """The hook must see live equity, not the 100k the engine starts on —
+        that is the whole point of it for a compounding account."""
+        seen = []
+
+        def rate(symbol, equity):
+            seen.append(equity)
+            return .0002
+
+        run(fixture(('ETHUSDT',)), self.base(), START, START + 3 * H4,
+            slippage_of=rate)
+        self.assertTrue(seen, 'slippage_of was never consulted')
+        # Slippage books an immediate unrealised loss, so equity moves off 100k.
+        self.assertTrue(any(e != 100000. for e in seen),
+                        'slippage_of only ever saw the starting equity')
+
+    def test_slippage_of_outranks_slippage_by_symbol(self):
+        """Given both, the equity-aware one wins: a caller that supplies it is
+        asking for size-dependent pricing, and silently using the flat rate
+        would understate cost without saying so."""
+        flat = {s: .05 for s in SYMBOLS}
+        both = run(fixture(('ETHUSDT',)), self.base(), START, START + 3 * H4,
+                   slippage_by_symbol=flat, slippage_of=lambda s, e: .0002)
+        only_of = run(fixture(('ETHUSDT',)), self.base(), START, START + 3 * H4,
+                      slippage_of=lambda s, e: .0002)
+        self.assertEqual(both['metrics']['final_equity'],
+                         only_of['metrics']['final_equity'])
+
+
 if __name__=='__main__':unittest.main()

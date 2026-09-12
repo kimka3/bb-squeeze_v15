@@ -64,17 +64,30 @@ class Market:
                 t=int(r['settlement_ms']);self.funding.setdefault((s,t//H4*H4),[]).append(r)
         self.returns=np.log(pd.DataFrame({s:d.close for s,d in data.items()})).diff().to_numpy()
 
-def run(market,config,start=START,end=END,slippage_by_symbol=None):
+def run(market,config,start=START,end=END,slippage_by_symbol=None,slippage_of=None):
     """slippage_by_symbol overrides config.slippage per symbol when given.
 
     Measured book depth is not the same on every market, so a flat rate either
     flatters the thin ones or punishes the deep ones. Omit it and every symbol
     uses config.slippage exactly as before — the default path is unchanged.
+
+    slippage_of(symbol, equity) goes one step further and prices each fill at the
+    size the account can actually take at that moment. A rate measured once is
+    wrong for a compounding account: this run grows 100k into 812k, so a position
+    at the end is eight times the one the rate was measured on, and slippage
+    grows faster than linearly in size. Both overrides are optional and the
+    default path touches neither.
     """
     costs=Costs(config.fee,config.slippage);cash=100000.;positions={};setups={};pending={}
     per_symbol=({s:Costs(config.fee,slippage_by_symbol.get(s,config.slippage)) for s in SYMBOLS}
                 if slippage_by_symbol else None)
-    def cost_for(symbol):return per_symbol[symbol] if per_symbol else costs
+    # Latest equity seen by the loop, so cost_for can size the walk. A cell rather
+    # than a closure variable because cost_for is defined before wealth exists.
+    live_equity=[cash]
+    def cost_for(symbol):
+        if slippage_of is not None:
+            return Costs(config.fee,slippage_of(symbol,live_equity[0]))
+        return per_symbol[symbol] if per_symbol else costs
     trades=[];equity=[];fund_ledger=[];need_micro=set();active_bars=set();missing_marks=set()
     stats={'skipped_cap':0,'skipped_filter':0,'ambiguous_subbars':0,'funding_price_fallbacks':0,
            'micro_position_bars':0,'coarse_position_bars':0,'funding_events':0}
@@ -144,7 +157,7 @@ def run(market,config,start=START,end=END,slippage_by_symbol=None):
             req=pending.pop(s,None)
             if req is None or s in positions:continue
             side,atr,signal_ms=req
-            wealth=eq(opens)
+            wealth=eq(opens);live_equity[0]=wealth
             def correlated(want,_s=s,_i=i):
                 past=market.returns[max(0,_i-180):_i];out=[]
                 for other,p in positions.items():
@@ -201,6 +214,7 @@ def run(market,config,start=START,end=END,slippage_by_symbol=None):
         fresh,filtered=scan_signals(ts,rows,SYMBOLS,LONGS,positions,setups,config)
         pending.update(fresh);stats['skipped_filter']+=filtered
         closes={s:float(r['close']) for s,r in rows.items()};wealth=eq(closes)
+        live_equity[0]=wealth
         equity.append({'time_ms':ts+H4,'equity':wealth,'cash':cash,'positions':len(positions),
             'gross':sum(p['qty']*closes[s] for s,p in positions.items()),'initial_risk':sum(risk(p) for p in positions.values()),
             'short_initial_risk':sum(risk(p) for p in positions.values() if p['side']=='SHORT'),
