@@ -320,6 +320,7 @@ class PaperTriggers(unittest.TestCase):
         b.book = {}
         b.fills = []
         b.breakeven_on_fill = kw.get('breakeven_on_fill', True)
+        b.passive_take_profit = kw.get('passive_take_profit', False)
         b.funding_rate_is_percent = True
         b._owner = {}
         b._next_index = 1
@@ -384,8 +385,8 @@ class PaperTriggers(unittest.TestCase):
 
 
 class _FakeQuote:
-    def __init__(self, qty):
-        self.vwap = 100.
+    def __init__(self, qty, vwap=100.):
+        self.vwap = vwap
         self.filled = qty
         self.requested = qty
         self.top = 100.
@@ -394,6 +395,81 @@ class _FakeQuote:
 
     def slippage_bps(self, reference, buying):
         return 0.0
+
+
+class PassiveTakeProfit(unittest.TestCase):
+    """The take-profit is the only leg worth resting. See execution_study.py:
+    entries lose more to adverse selection than passivity saves, and a stop that
+    does not fill is not a stop."""
+
+    def _broker(self, tmp, **kw):
+        from live.paper import PaperBroker, PaperPosition
+        b = PaperBroker.__new__(PaperBroker)
+        b.base_url = 'http://unused'
+        b.markets = fake_markets()
+        b.state_path = Path(tmp) / 'paper.json'
+        b.cash = 100_000.
+        b.book = {}
+        b.fills = []
+        b.breakeven_on_fill = True
+        b.passive_take_profit = kw.get('passive_take_profit', True)
+        b.funding_rate_is_percent = True
+        b._owner = {}
+        b._next_index = 1
+        b._marks = {}
+        b._last_funding_hour = 10 ** 9
+        b._quote = lambda symbol, qty, buying: _FakeQuote(qty, vwap=95.5)
+        b.refresh_marks = lambda: b._marks
+        b._accrue_funding = lambda marks: None
+        b.save = lambda: None
+        b.book['ETHUSDT'] = PaperPosition(side='SHORT', entry=100., qty=10.,
+                                          initial_qty=10., stop=104., tp=96.)
+        return b
+
+    def test_resting_take_profit_fills_at_its_own_price(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._broker(tmp)
+            b._marks = {'ETHUSDT': 95.9}
+            fill = b.poll()[0]
+            self.assertEqual(fill.role, 'TP2R')
+            self.assertEqual(fill.price, 96., 'a maker order fills at its own limit')
+            self.assertEqual(fill.slippage_bps, 0.0, 'and pays no spread')
+
+    def test_crossing_take_profit_pays_the_book(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._broker(tmp, passive_take_profit=False)
+            b._marks = {'ETHUSDT': 95.9}
+            fill = b.poll()[0]
+            self.assertEqual(fill.price, 95.5, 'a taker fill walks the book instead')
+
+    def test_breakeven_waits_for_the_whole_2R_leg(self):
+        """A resting limit can fill in pieces. Arming breakeven off a sliver
+        would tighten the stop on a position still carrying its full risk."""
+        import tempfile
+        from live.broker import AccountState
+        with tempfile.TemporaryDirectory() as tmp:
+            trader = Trader(live_config(tmp), DryRunBroker(100_000.),
+                            fake_markets(), Journal(tmp))
+            trader.positions['ETHUSDT'] = {'side': 'SHORT', 'qty': 10., 'initial_qty': 10.,
+                                           'stop': 104., 'entry': 100.,
+                                           'partial_taken': False, 'bars': 1}
+            sliver = AccountState(equity=1e5, maintenance_margin=1.,
+                                  positions={'ETH': {'side': 'SHORT', 'qty': 9.,
+                                                     'entry': 100.}})
+            trader._sync_fills(sliver)
+            p = trader.positions['ETHUSDT']
+            self.assertFalse(p['partial_taken'], '10% of the leg is not the leg')
+            self.assertEqual(p['stop'], 104., 'stop must not tighten yet')
+
+            done = AccountState(equity=1e5, maintenance_margin=1.,
+                                positions={'ETH': {'side': 'SHORT', 'qty': 5.,
+                                                   'entry': 100.}})
+            trader._sync_fills(done)
+            p = trader.positions['ETHUSDT']
+            self.assertTrue(p['partial_taken'])
+            self.assertEqual(p['stop'], 100.)
 
 
 class ConfigSafety(unittest.TestCase):

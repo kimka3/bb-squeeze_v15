@@ -95,9 +95,21 @@ class Trader:
                 continue
             if actual['qty'] < p['qty'] * .99:
                 p['qty'] = actual['qty']
-                if not p['partial_taken']:
+                if p['partial_taken']:
+                    continue
+                # A resting post-only take-profit can fill in pieces, unlike the
+                # all-or-nothing trigger order it replaced. Arm breakeven only
+                # once the whole 2R leg is done: moving the stop after a sliver
+                # filled would tighten it on a position that still carries its
+                # full intended risk.
+                closed = p['initial_qty'] - actual['qty']
+                leg = p['initial_qty'] * self.cfg.tp_fraction
+                if leg > 0 and closed >= leg * .99:
                     apply_tp_fill(p)
                     notes.append(f'{symbol}: 2R partial filled, stop moved to breakeven')
+                else:
+                    notes.append(f'{symbol}: take-profit {closed / leg:.0%} filled — '
+                                 'breakeven not armed until the leg completes')
         return notes
 
     @property

@@ -35,11 +35,13 @@ def build(config: LiveConfig):
     if config.mode == 'live':
         broker = LighterBroker(config.base_url, config.account_index,
                                config.private_key, config.api_key_index,
-                               stop_limit_pct=config.max_slippage_pct)
+                               stop_limit_pct=config.max_slippage_pct,
+                               passive_take_profit=config.passive_take_profit)
     elif config.mode == 'paper':
         broker = PaperBroker(config.base_url, markets,
                              config.state_dir / 'paper.json',
-                             breakeven_on_fill=config.breakeven_on_fill)
+                             breakeven_on_fill=config.breakeven_on_fill,
+                             passive_take_profit=config.passive_take_profit)
         broker.refresh_marks()
     else:
         broker = DryRunBroker()

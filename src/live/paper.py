@@ -67,7 +67,8 @@ class PaperBroker:
 
     def __init__(self, base_url: str, markets: dict, state_path: Path,
                  equity: float = 100_000.0, breakeven_on_fill: bool = True,
-                 funding_rate_is_percent: bool = True):
+                 funding_rate_is_percent: bool = True,
+                 passive_take_profit: bool = True):
         self.base_url = base_url.rstrip('/')
         self.markets = markets
         self.state_path = Path(state_path)
@@ -75,6 +76,7 @@ class PaperBroker:
         self.book: dict[str, PaperPosition] = {}
         self.fills: list[PaperFill] = []
         self.breakeven_on_fill = breakeven_on_fill
+        self.passive_take_profit = passive_take_profit
         # /api/v1/fundings reports `rate` as a percent per hourly settlement
         # (BTC showed 0.0012, i.e. ~1bp per 8h, matching the published typical).
         # Flagged rather than asserted: paper mode reports accrued funding so the
@@ -244,6 +246,12 @@ class PaperBroker:
     def _fill_trigger(self, symbol, p: PaperPosition, qty: float, trigger: float,
                       role: str, mark: float) -> PaperFill:
         buying = p.side == 'SHORT'          # closing a short buys
+        if role == 'TP2R' and self.passive_take_profit:
+            # A resting maker order fills AT its own price. It pays no spread and
+            # walks no depth — that is the whole point of leaving it in the book.
+            q = _MakerQuote(qty)
+            return self._book_close(symbol, p, min(qty, p.qty), trigger, role,
+                                    mark, trigger, q)
         q = self._quote(symbol, qty, buying)
         price = q.vwap if q.filled > 0 else trigger
         filled = min(q.filled or qty, p.qty)
@@ -341,6 +349,18 @@ class PaperBroker:
             'funding_paid': sum(p.funding for p in self.book.values()),
             'backtest_assumption_bps': 2.0,
         }
+
+
+class _MakerQuote:
+    """A resting order that filled at its own price: no spread, no depth walked."""
+
+    def __init__(self, qty: float):
+        self.filled = qty
+        self.requested = qty
+        self.exhausted = False
+
+    def slippage_bps(self, reference, buying):
+        return 0.0
 
 
 def _now_ms() -> int:

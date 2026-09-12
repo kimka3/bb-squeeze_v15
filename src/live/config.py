@@ -50,6 +50,10 @@ class LiveConfig:
     poll_seconds: int = 60              # how often resting stops are checked against mark
     breakeven_on_fill: bool = True      # move the stop on the TP fill, not at the next bar
 
+    # Execution. Only the take-profit leg is worth making passive — see
+    # src/live/execution_study.py. Entries and stops must cross the book.
+    passive_take_profit: bool = True
+
     # Guards
     margin_ratio_block_entries: float = 3.0   # equity / maintenance margin
     margin_ratio_alert: float = 2.0

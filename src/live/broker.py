@@ -148,11 +148,14 @@ class LighterBroker:
     """
 
     def __init__(self, base_url: str, account_index: int, private_key: str,
-                 api_key_index: int = 0, stop_limit_pct: float = .01):
+                 api_key_index: int = 0, stop_limit_pct: float = .01,
+                 passive_take_profit: bool = True):
         import lighter                                   # imported lazily: shadow mode needs no SDK
         self.base_url = base_url.rstrip('/')
         self.account_index = account_index
         self.stop_limit_pct = stop_limit_pct
+        self.passive_take_profit = passive_take_profit
+        self._post_only_rejections = 0
         self._loop = asyncio.new_event_loop()
         self._signer = lighter.SignerClient(
             url=self.base_url, account_index=account_index,
@@ -239,8 +242,32 @@ class LighterBroker:
 
     def place_take_profit(self, market: Market, symbol: str, position_side: str,
                           qty: float, trigger: float, coi: int) -> OrderRef:
+        """Rest the 2R target in the book as a post-only maker order.
+
+        The take-profit is the one leg where passivity is free: it sits at a
+        price better than market, so it is a natural maker, and an unfilled
+        take-profit is simply a target price that never arrived. Entries and
+        stops get no such luxury — see src/live/execution_study.py for the
+        measurements that rule them out.
+
+        Post-only is rejected if the price would cross. That only happens when
+        the market has already gone past the target in our favour, so the
+        fallback takes the trigger order and accepts the crossing fill.
+        """
+        import lighter
         base = market.scale_size(qty)
         ask = _is_ask(position_side, closing=True)
+        if self.passive_take_profit:
+            tx, resp, err = self._run(self._signer.create_order(
+                market_index=market.market_id, client_order_index=coi,
+                base_amount=base, price=market.scale_price(trigger), is_ask=ask,
+                order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
+                time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,
+                reduce_only=True))
+            if not err:
+                return OrderRef(coi, self._find_order_index(market, coi), 'TP')
+            # Crossed, or post-only unsupported here: fall through to the trigger.
+            self._post_only_rejections += 1
         bound = trigger * (1 - self.stop_limit_pct) if ask else trigger * (1 + self.stop_limit_pct)
         self._send(self._signer.create_tp_order(
             market_index=market.market_id, client_order_index=coi, base_amount=base,
