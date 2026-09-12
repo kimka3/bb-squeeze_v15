@@ -1,0 +1,33 @@
+[Unit]
+Description=BB Squeeze fixed 28-day paper observation campaign
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=bbpaper
+Group=bbpaper
+WorkingDirectory=/opt/bb-squeeze
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+Environment=DRY_RUN=true
+ExecStartPre=/bin/bash /opt/bb-squeeze/scripts/paper_preflight.sh /var/lib/bb-squeeze/campaign-01
+ExecStart=/opt/bb-squeeze/.venv/bin/python /opt/bb-squeeze/src/live/supervisor.py start --campaign-dir /var/lib/bb-squeeze/campaign-01 --config /opt/bb-squeeze/paper.config.json
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=75 78
+KillMode=control-group
+TimeoutStopSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bb-squeeze /opt/bb-squeeze/data
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
