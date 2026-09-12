@@ -32,7 +32,12 @@ ROOT = Path(__file__).resolve().parents[2]
 TRADES = ROOT / 'results/cases/zero_fee_cap4_risk200/trades.csv'
 
 HYPERLIQUID = 'https://api.hyperliquid.xyz/info'
-BINANCE_FAPI = 'https://fapi.binance.com/fapi/v1/depth'
+
+# USD-M futures depth. fapi.binance.com answers 451 from restricted regions, but
+# www.binance.com serves the same /fapi path and is reachable where fapi is not.
+# Verified 2026-09-12: identical response shape (lastUpdateId/E/T/bids/asks),
+# 1000 levels, top of book within 1bp of Lighter's mark for the same market.
+BINANCE_HOSTS = ('https://fapi.binance.com', 'https://www.binance.com')
 
 # Taker fee per side, basis points. Verified 2026-09-12:
 #   Lighter      Standard account, 0 maker / 0 taker (docs + orderBooks payload)
@@ -98,14 +103,27 @@ def hyperliquid_book(coin: str, need: float = 0.) -> tuple[dict | None, float]:
 
 
 def binance_book(symbol: str) -> dict | None:
-    try:
-        d = _get(f'{BINANCE_FAPI}?symbol={symbol}&limit=1000')
-    except urllib.error.HTTPError:
-        return None                      # 451 from a restricted region, or symbol gone
-    except Exception:
-        return None
-    return {'bids': [{'price': p, 'remaining_base_amount': q} for p, q in d.get('bids', [])],
-            'asks': [{'price': p, 'remaining_base_amount': q} for p, q in d.get('asks', [])]}
+    """Futures depth, trying each host until one answers.
+
+    A 451 means this location is restricted, not that the market is gone — so a
+    blocked host is a reason to try the next one, never a reason to report the
+    venue as unmeasurable.
+    """
+    for host in BINANCE_HOSTS:
+        try:
+            d = _get(f'{host}/fapi/v1/depth?symbol={symbol}&limit=1000')
+        except urllib.error.HTTPError as exc:
+            if exc.code in (451, 403):
+                continue                 # restricted here; try the next host
+            return None
+        except Exception:
+            continue
+        bids, asks = d.get('bids') or [], d.get('asks') or []
+        if not bids or not asks:
+            return None
+        return {'bids': [{'price': p, 'remaining_base_amount': q} for p, q in bids],
+                'asks': [{'price': p, 'remaining_base_amount': q} for p, q in asks]}
+    return None
 
 
 def lighter_book(market_id: int) -> dict | None:
@@ -138,13 +156,18 @@ def notional_share() -> dict[str, float]:
     return {k: v / total for k, v in share.items()}
 
 
-def main(equity: float, multiple: float = 0.86) -> int:
-    markets = load_markets(MAINNET, SYMBOL_TO_LIGHTER)
+def main(equity: float, multiple: float = 0.86, traded_only: bool = False) -> int:
+    from live.config import LiveConfig
+    wanted = LiveConfig().lighter_universe if traded_only else SYMBOL_TO_LIGHTER
+    markets = load_markets(MAINNET, wanted)
     px = marks(MAINNET, markets)
     share = notional_share()
 
+    excluded = [s for s in SYMBOL_TO_LIGHTER if s not in wanted]
     print(f'venue comparison   equity {equity:,.0f}   position {multiple:.2f}x '
           f'= {equity * multiple:,.0f} USDT notional   sell side')
+    print(f'universe {len(wanted)} symbols'
+          + (f'   excluded: {", ".join(excluded)}' if excluded else ''))
     print('cost = slippage vs mid + taker fee, basis points per side\n')
     print(f"{'symbol':9s}{'weight':>8s}{'lighter':>10s}{'hyperlq':>10s}{'binance':>10s}"
           f"{'  cheapest':>12s}")
@@ -227,5 +250,7 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--equity', type=float, default=100_000.)
     ap.add_argument('--multiple', type=float, default=0.86)
+    ap.add_argument('--traded-only', action='store_true', dest='traded_only',
+                    help='only the symbols the live config actually trades')
     a = ap.parse_args()
-    raise SystemExit(main(a.equity, a.multiple))
+    raise SystemExit(main(a.equity, a.multiple, a.traded_only))
