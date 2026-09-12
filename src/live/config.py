@@ -46,6 +46,10 @@ class LiveConfig:
     bar_grace_seconds: int = 60         # how late a Binance bar may be before we skip
     min_notional_usd: float = 10.0      # Lighter min_quote_amount on every market
 
+    # Paper mode (stage 2)
+    poll_seconds: int = 60              # how often resting stops are checked against mark
+    breakeven_on_fill: bool = True      # move the stop on the TP fill, not at the next bar
+
     # Guards
     margin_ratio_block_entries: float = 3.0   # equity / maintenance margin
     margin_ratio_alert: float = 2.0

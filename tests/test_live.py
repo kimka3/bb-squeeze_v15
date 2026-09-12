@@ -267,6 +267,135 @@ class Reconcile(unittest.TestCase):
         self.assertFalse(v.halt)
 
 
+class BookWalk(unittest.TestCase):
+    """Slippage is measured off real depth instead of assumed."""
+
+    DEPTH = {'asks': [{'price': '100.0', 'remaining_base_amount': '1'},
+                      {'price': '101.0', 'remaining_base_amount': '2'},
+                      {'price': '105.0', 'remaining_base_amount': '10'}],
+             'bids': [{'price': '99.0', 'remaining_base_amount': '1'},
+                      {'price': '98.0', 'remaining_base_amount': '2'},
+                      {'price': '90.0', 'remaining_base_amount': '10'}]}
+
+    def test_buy_walks_asks_upward(self):
+        from live.book import walk
+        q = walk(self.DEPTH, 3., buying=True)
+        self.assertAlmostEqual(q.vwap, (1 * 100. + 2 * 101.) / 3)
+        self.assertEqual(q.top, 100.)
+        self.assertEqual(q.worst, 101.)
+        self.assertFalse(q.exhausted)
+
+    def test_sell_walks_bids_downward(self):
+        from live.book import walk
+        q = walk(self.DEPTH, 3., buying=False)
+        self.assertAlmostEqual(q.vwap, (1 * 99. + 2 * 98.) / 3)
+
+    def test_size_beyond_visible_depth_is_flagged(self):
+        from live.book import walk
+        q = walk(self.DEPTH, 999., buying=True)
+        self.assertTrue(q.exhausted)
+        self.assertLess(q.filled, q.requested)
+
+    def test_slippage_is_signed_as_a_cost(self):
+        from live.book import walk
+        buy = walk(self.DEPTH, 3., buying=True)
+        self.assertGreater(buy.slippage_bps(100., buying=True), 0,
+                           'paying above the reference is a positive cost')
+        sell = walk(self.DEPTH, 3., buying=False)
+        self.assertGreater(sell.slippage_bps(99., buying=False), 0,
+                           'selling below the reference is also a positive cost')
+
+
+class PaperTriggers(unittest.TestCase):
+    """Lighter fires stops on MARK price. The backtest fires on traded price.
+    Reproducing the mark basis is the whole point of stage 2."""
+
+    def _broker(self, tmp, **kw):
+        from live.paper import PaperBroker, PaperPosition
+        b = PaperBroker.__new__(PaperBroker)          # no network in unit tests
+        b.base_url = 'http://unused'
+        b.markets = fake_markets()
+        b.state_path = Path(tmp) / 'paper.json'
+        b.cash = 100_000.
+        b.book = {}
+        b.fills = []
+        b.breakeven_on_fill = kw.get('breakeven_on_fill', True)
+        b.funding_rate_is_percent = True
+        b._owner = {}
+        b._next_index = 1
+        b._marks = {}
+        b._last_funding_hour = 10 ** 9                # funding already settled
+        b._quote = lambda symbol, qty, buying: _FakeQuote(qty)
+        b.refresh_marks = lambda: b._marks
+        b._accrue_funding = lambda marks: None
+        b.save = lambda: None
+        b.book['ETHUSDT'] = PaperPosition(side='SHORT', entry=100., qty=10.,
+                                          initial_qty=10., stop=104., tp=96.)
+        return b
+
+    def test_short_stop_fires_when_mark_crosses_up(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._broker(tmp)
+            b._marks = {'ETHUSDT': 103.9}
+            self.assertEqual(b.poll(), [], 'below the trigger nothing fires')
+            b._marks = {'ETHUSDT': 104.1}
+            fired = b.poll()
+            self.assertEqual([f.role for f in fired], ['STOP'])
+            self.assertNotIn('ETHUSDT', b.book)
+
+    def test_take_profit_takes_half_and_arms_breakeven(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._broker(tmp)
+            b._marks = {'ETHUSDT': 95.9}
+            fired = b.poll()
+            self.assertEqual([f.role for f in fired], ['TP2R'])
+            p = b.book['ETHUSDT']
+            self.assertAlmostEqual(p.qty, 5.)
+            self.assertTrue(p.partial_taken)
+            self.assertEqual(p.stop, 100., 'stop must move to breakeven on the fill')
+
+    def test_breakeven_can_be_disabled_to_measure_the_delay(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._broker(tmp, breakeven_on_fill=False)
+            b._marks = {'ETHUSDT': 95.9}
+            b.poll()
+            self.assertEqual(b.book['ETHUSDT'].stop, 104.,
+                             'without a fill subscription the stop stays put')
+
+    def test_stop_wins_when_both_could_fire(self):
+        """The backtest resolves that ambiguity stop-first; paper must not be
+        more optimistic than the model it is being compared against.
+
+        A short can reach this state: the trail drags the stop down past the 2R
+        level, so one mark sits at or beyond both triggers at once.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._broker(tmp)
+            b.book['ETHUSDT'].stop = 95.              # trailed below the 2R target
+            b.book['ETHUSDT'].tp = 96.
+            b._marks = {'ETHUSDT': 95.5}              # >= stop AND <= tp
+            fired = b.poll()
+            self.assertEqual([f.role for f in fired], ['STOP'])
+            self.assertNotIn('ETHUSDT', b.book, 'the stop closes the whole position')
+
+
+class _FakeQuote:
+    def __init__(self, qty):
+        self.vwap = 100.
+        self.filled = qty
+        self.requested = qty
+        self.top = 100.
+        self.worst = 100.
+        self.exhausted = False
+
+    def slippage_bps(self, reference, buying):
+        return 0.0
+
+
 class ConfigSafety(unittest.TestCase):
     def test_live_mode_requires_an_account_index(self):
         with self.assertRaises(ValueError):
