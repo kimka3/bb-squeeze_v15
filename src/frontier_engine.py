@@ -64,8 +64,17 @@ class Market:
                 t=int(r['settlement_ms']);self.funding.setdefault((s,t//H4*H4),[]).append(r)
         self.returns=np.log(pd.DataFrame({s:d.close for s,d in data.items()})).diff().to_numpy()
 
-def run(market,config,start=START,end=END):
+def run(market,config,start=START,end=END,slippage_by_symbol=None):
+    """slippage_by_symbol overrides config.slippage per symbol when given.
+
+    Measured book depth is not the same on every market, so a flat rate either
+    flatters the thin ones or punishes the deep ones. Omit it and every symbol
+    uses config.slippage exactly as before — the default path is unchanged.
+    """
     costs=Costs(config.fee,config.slippage);cash=100000.;positions={};setups={};pending={}
+    per_symbol=({s:Costs(config.fee,slippage_by_symbol.get(s,config.slippage)) for s in SYMBOLS}
+                if slippage_by_symbol else None)
+    def cost_for(symbol):return per_symbol[symbol] if per_symbol else costs
     trades=[];equity=[];fund_ledger=[];need_micro=set();active_bars=set();missing_marks=set()
     stats={'skipped_cap':0,'skipped_filter':0,'ambiguous_subbars':0,'funding_price_fallbacks':0,
            'micro_position_bars':0,'coarse_position_bars':0,'funding_events':0}
@@ -117,7 +126,7 @@ def run(market,config,start=START,end=END):
             action=p.pop('pending_exit',None)
             if action:
                 q=p['qty']*(.5 if action=='BB_HALF' else 1.)
-                cash+=close_fill(p,q,opens[s],costs,ts,action)
+                cash+=close_fill(p,q,opens[s],cost_for(s),ts,action)
                 if p['qty']<=1e-12:finish(s,ts,action)
                 else:p['long_half_taken']=True
         def priority(symbol):
@@ -146,11 +155,11 @@ def run(market,config,start=START,end=END):
                     corr=np.corrcoef(pair.T)[0,1] if len(pair)>=120 else 1.
                     if not np.isfinite(corr) or corr>=.7:out.append(p)
                 return out
-            plan=plan_entry(s,side,atr,wealth,opens,positions,config,costs,
+            plan=plan_entry(s,side,atr,wealth,opens,positions,config,cost_for(s),
                 btc_bull=btc_bull_at(market.rows['BTCUSDT'][signal_ms]),correlated=correlated)
             if plan.skipped=='invalid':continue
             if plan.skipped=='cap':stats['skipped_cap']+=1;continue
-            fee=plan.qty*plan.px*costs.fee;cash-=fee
+            fee=plan.qty*plan.px*cost_for(s).fee;cash-=fee
             positions[s]=open_position(side,ts,signal_ms,plan,plan.qty,wealth,fee,
                 float(market.rows[s][signal_ms].get('x_bb_lower',0.)))
 
@@ -176,7 +185,7 @@ def run(market,config,start=START,end=END):
                 # movement after the exit and are labelled as such in reports.
                 p['mfe']=max(p['mfe'],(h-p['entry']) if p['side']=='LONG' else (p['entry']-l))
                 p['mae']=min(p['mae'],(l-p['entry']) if p['side']=='LONG' else (p['entry']-h))
-                change,amb=intrabar(p,[o,h,l,c],costs,config.tp_fraction,t,config.ambiguity)
+                change,amb=intrabar(p,[o,h,l,c],cost_for(s),config.tp_fraction,t,config.ambiguity)
                 cash+=change;stats['ambiguous_subbars']+=int(amb)
                 if p['qty']<=1e-12:
                     finish(s,t,p['fills'][-1]['role']);break
@@ -199,7 +208,7 @@ def run(market,config,start=START,end=END):
         if wealth<=0:raise RuntimeError('Account equity exhausted')
     last=int(equity[-1]['time_ms'])
     for s,p in list(positions.items()):
-        close=market.rows[s][last-H4]['close'];cash+=close_fill(p,p['qty'],close,costs,last,'EOD');finish(s,last,'EOD')
+        close=market.rows[s][last-H4]['close'];cash+=close_fill(p,p['qty'],close,cost_for(s),last,'EOD');finish(s,last,'EOD')
     equity[-1].update(equity=cash,cash=cash,positions=0,gross=0,initial_risk=0,short_initial_risk=0,short_gross=0)
     eqdf=pd.DataFrame(equity);tdf=pd.DataFrame(trades)
     if not np.isclose(cash,100000+tdf.net_pnl.sum(),rtol=1e-10,atol=1e-6):raise AssertionError('Cash ledger does not reconcile')
