@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from data_io import SYMBOLS,LONGS,H4,START,END
 from trade_core import Costs,execution_price,remaining_initial_risk,intrabar,close_fill,funding_cashflow,tighten_stop
+from live_core import plan_entry,open_position,update_on_bar_close,scan_signals,remaining_risk,btc_bull_at
 
 @dataclass(frozen=True)
 class Strategy:
@@ -71,7 +72,7 @@ def run(market,config,start=START,end=END):
     history=market.timestamps
     def eq(prices):
         return cash+sum((prices[s]-p['entry'])*p['qty']*(1 if p['side']=='LONG' else -1) for s,p in positions.items())
-    def risk(p):return remaining_initial_risk(p['initial_risk'],p['initial_qty'],p['qty'])
+    risk=remaining_risk
     def finish(s,t,reason):
         p=positions.pop(s)
         net=p['gross_pnl']-p['fees']+p['funding']
@@ -134,40 +135,24 @@ def run(market,config,start=START,end=END):
             req=pending.pop(s,None)
             if req is None or s in positions:continue
             side,atr,signal_ms=req
-            wealth=eq(opens);unit=atr*(config.long_stop_atr if side=='LONG' else config.short_stop_atr)
-            if wealth<=0 or not math.isfinite(unit) or unit<=0:continue
-            px=execution_price(opens[s],side,True,costs)
-            desired=wealth*config.risk*(config.short_risk_multiple if side=='SHORT' else 1)
-            if side=='SHORT' and config.short_btc_bull_risk!=1.:
-                known_btc=market.rows['BTCUSDT'][signal_ms]
-                if float(known_btc['close'])>=float(known_btc['x_ma200']):desired*=config.short_btc_bull_risk
-            room=wealth*config.total_risk-sum(risk(p) for p in positions.values())
-            if side=='SHORT' and config.short_cap_r:
-                room=min(room,wealth*config.risk*config.short_cap_r-sum(risk(p) for p in positions.values() if p['side']=='SHORT'))
-            if config.correlated_cap_r and positions:
-                past=market.returns[max(0,i-180):i]
-                correlated=[]
+            wealth=eq(opens)
+            def correlated(want,_s=s,_i=i):
+                past=market.returns[max(0,_i-180):_i];out=[]
                 for other,p in positions.items():
-                    if p['side']!=side:continue
-                    pair=past[:,[SYMBOLS.index(s),SYMBOLS.index(other)]]
+                    if p['side']!=want:continue
+                    pair=past[:,[SYMBOLS.index(_s),SYMBOLS.index(other)]]
                     pair=pair[np.isfinite(pair).all(axis=1)]
                     # Unknown correlation is treated as common risk.
                     corr=np.corrcoef(pair.T)[0,1] if len(pair)>=120 else 1.
-                    if not np.isfinite(corr) or corr>=.7:correlated.append(p)
-                room=min(room,wealth*config.risk*config.correlated_cap_r-sum(risk(p) for p in correlated))
-            notional_room=wealth*config.gross_cap-sum(p['qty']*opens[a] for a,p in positions.items())
-            q=min(desired/unit,max(0,room)/unit,max(0,notional_room)/px)
-            if len(positions)>=config.max_positions or q<desired/unit*.1:
-                stats['skipped_cap']+=1;continue
-            fee=q*px*costs.fee;cash-=fee
-            positions[s]={'side':side,'entry_ms':ts,'signal_ms':signal_ms,'entry':px,
-                'initial_qty':q,'qty':q,'risk_unit':unit,'initial_risk':q*unit,
-                'entry_equity':wealth,'requested_risk_pct':100*desired/wealth,
-                'breakout_level':float(market.rows[s][signal_ms].get('x_bb_lower',0.)),
-                'stop':px-unit if side=='LONG' else px+unit,'tp2r':px-2*unit,
-                'partial_taken':False,'long_half_taken':False,'below_mid':0,'bars':0,
-                'lowest':px,'highest':px,'gross_pnl':0.,'fees':fee,'funding':0.,
-                'mfe':0.,'mae':0.,'fills':[{'time_ms':ts,'role':'ENTRY','qty':q,'price':px,'fee':fee,'gross_pnl':0.}]}
+                    if not np.isfinite(corr) or corr>=.7:out.append(p)
+                return out
+            plan=plan_entry(s,side,atr,wealth,opens,positions,config,costs,
+                btc_bull=btc_bull_at(market.rows['BTCUSDT'][signal_ms]),correlated=correlated)
+            if plan.skipped=='invalid':continue
+            if plan.skipped=='cap':stats['skipped_cap']+=1;continue
+            fee=plan.qty*plan.px*costs.fee;cash-=fee
+            positions[s]=open_position(side,ts,signal_ms,plan,plan.qty,wealth,fee,
+                float(market.rows[s][signal_ms].get('x_bb_lower',0.)))
 
         # OHLC for active positions only. Micro cache includes the FULL 4h bar.
         # No future micro prices enter the 4h signal or position sizing.
@@ -202,47 +187,10 @@ def run(market,config,start=START,end=END):
 
         # Close rules and monotone trails become active on next bar.
         for s,p in positions.items():
-            r=rows[s]
-            if p['side']=='LONG':
-                below=float(r['close'])<float(r['l_bb_mid'])
-                p['below_mid']=p['below_mid']+1 if below else 0
-                p['highest']=max(p['highest'],float(r['high']))
-                if config.long_exit=='bb_mid' and below:p['pending_exit']='BB_MID'
-                elif config.long_exit=='confirm2' and p['below_mid']>=2:p['pending_exit']='BB_CONFIRM2'
-                elif config.long_exit=='half_runner' and below and not p['long_half_taken']:p['pending_exit']='BB_HALF'
-                if config.long_exit=='atr' or (config.long_exit=='half_runner' and p['long_half_taken']):
-                    tighten_stop(p,p['highest']-config.long_trail*float(r['l_atr']))
-                if p['bars']>=180:p['pending_exit']='TIME'
-            else:
-                p['lowest']=min(p['lowest'],float(r['low']))
-                if p['entry']-p['lowest']>=config.trail_activation_r*p['risk_unit']:
-                    tighten_stop(p,p['lowest']+config.short_trail_atr*float(r['s_atr']))
-                if p['partial_taken']:tighten_stop(p,p['entry'])
-                if config.short_reject_bars and p['bars']<=config.short_reject_bars and not p['partial_taken'] and float(r['close'])>p['breakout_level']:
-                    p['pending_exit']='FAILED_BREAKOUT'
-                if config.short_progress_bars and p['bars']==config.short_progress_bars and float(r['close'])>=p['entry']:
-                    p['pending_exit']='NO_PROGRESS'
-                if p['bars']>=90:p['pending_exit']='TIME'
+            update_on_bar_close(p,rows[s],config)
         # Generate new close signals and the long retest state machine.
-        for s in SYMBOLS:
-            r=rows[s]
-            if s in positions:
-                setups.pop(s,None);continue
-            short=bool(r['short_signal']);long=False
-            if short and config.short_min_atr_pct and float(r['s_atr'])/float(r['close'])<config.short_min_atr_pct:
-                short=False;stats['skipped_filter']+=1
-            if short and config.short_btc_bear:
-                btc=rows['BTCUSDT']
-                if float(btc['close'])>=float(btc['x_ma200']):short=False;stats['skipped_filter']+=1
-            if s in LONGS:
-                if bool(r['long_breakout']):setups[s]=[float(r['l_bb_upper']),config.long_retest_bars]
-                elif s in setups:
-                    ref,left=setups[s]
-                    long=(float(r['low'])<=ref*1.005 and float(r['close'])>ref and float(r['close'])>float(r['open']) and float(r['close'])>float(r['l_ma200']) and float(r['l_ma200_slope'])>0)
-                    if long or left<=1:setups.pop(s,None)
-                    else:setups[s][1]-=1
-            if short and not long:pending[s]=('SHORT',float(r['s_atr']),ts)
-            if long and not short:pending[s]=('LONG',float(r['l_atr']),ts)
+        fresh,filtered=scan_signals(ts,rows,SYMBOLS,LONGS,positions,setups,config)
+        pending.update(fresh);stats['skipped_filter']+=filtered
         closes={s:float(r['close']) for s,r in rows.items()};wealth=eq(closes)
         equity.append({'time_ms':ts+H4,'equity':wealth,'cash':cash,'positions':len(positions),
             'gross':sum(p['qty']*closes[s] for s,p in positions.items()),'initial_risk':sum(risk(p) for p in positions.values()),

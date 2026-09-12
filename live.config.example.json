@@ -1,0 +1,22 @@
+{
+  "mode": "shadow",
+  "base_url": "https://mainnet.zklighter.elliot.ai",
+  "account_index": null,
+  "api_key_index": 0,
+  "state_dir": "live_state",
+  "max_slippage_pct": 0.005,
+  "bar_grace_seconds": 60,
+  "margin_ratio_block_entries": 3.0,
+  "margin_ratio_alert": 2.0,
+  "max_basis_divergence_pct": 1.0,
+  "strategy": {
+    "name": "live_A_risk200",
+    "risk": 0.02,
+    "short_btc_bull_risk": 0.5,
+    "total_risk": 0.04,
+    "gross_cap": 5.0,
+    "max_positions": 6,
+    "fee": 0.0,
+    "slippage": 0.0002
+  }
+}

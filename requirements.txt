@@ -1,2 +1,5 @@
 numpy==2.3.5
 pandas==2.2.3
+
+# Live execution only (not needed for the backtest):
+# lighter-sdk==1.0.0

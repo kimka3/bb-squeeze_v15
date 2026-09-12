@@ -34,6 +34,16 @@ def close_fill(position, qty, reference, costs, time_ms, reason):
                               'price':price,'fee':fee,'gross_pnl':gross})
     return gross-fee
 
+def mark_partial_taken(position):
+    """Book the 2R partial: the stop moves to breakeven.
+
+    The backtest reaches this from intrabar(); the live bot reaches it from the
+    exchange fill event. One implementation so the two cannot diverge.
+    """
+    position['partial_taken'] = True
+    position['stop'] = min(position['stop'], position['entry'])
+
+
 def intrabar(position, bar, costs, tp_fraction, time_ms, ambiguity='stop_first'):
     """Execute one OHLC bar. Old stop first; newly armed BE rechecked.
 
@@ -61,8 +71,7 @@ def intrabar(position, bar, costs, tp_fraction, time_ms, ambiguity='stop_first')
         qty=position['qty']*tp_fraction
         if qty>0:
             cash+=close_fill(position,qty,min(o,position['tp2r']),costs,time_ms,'TP2R')
-        position['partial_taken']=True
-        position['stop']=min(stop,position['entry'])
+        mark_partial_taken(position)
         if position['qty']>0 and h>=position['stop']:
             ambiguous=True
             if ambiguity=='stop_first' or hit_stop or tp_at_open or c>=position['stop']:
