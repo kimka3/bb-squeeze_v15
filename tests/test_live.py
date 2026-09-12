@@ -52,7 +52,9 @@ def fake_markets():
 
 
 def live_config(tmp, **over):
-    kw = dict(mode='shadow', state_dir=tmp,
+    # Existing tests exercise the full eleven; the BCH exclusion is a live
+    # default, tested separately in TradedUniverse.
+    kw = dict(mode='shadow', state_dir=tmp, universe=tuple(SYMBOLS),
               strategy=Strategy(risk=.02, short_btc_bull_risk=.5, fee=0., slippage=0.,
                                 funding=False),
               max_basis_divergence_pct=1e9, min_notional_usd=0.)
@@ -470,6 +472,39 @@ class PassiveTakeProfit(unittest.TestCase):
             p = trader.positions['ETHUSDT']
             self.assertTrue(p['partial_taken'])
             self.assertEqual(p['stop'], 100.)
+
+
+class TradedUniverse(unittest.TestCase):
+    """BCH is excluded by default on cost grounds: 44.6bp round trip is 0.383R,
+    i.e. 38% of the risk budget handed to the book before the trade has a view."""
+
+    def test_bch_is_excluded_by_default(self):
+        from live.config import DEFAULT_UNIVERSE, EXCLUDED
+        self.assertIn('BCHUSDT', EXCLUDED)
+        self.assertNotIn('BCHUSDT', DEFAULT_UNIVERSE)
+        self.assertEqual(len(DEFAULT_UNIVERSE), len(SYMBOLS) - 1)
+
+    def test_excluded_symbol_never_produces_an_entry(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            config = live_config(tmp, universe=LiveConfig().universe)
+            trader = Trader(config, DryRunBroker(100_000.), fake_markets(), Journal(tmp))
+            data = frames(tuple(SYMBOLS))          # every symbol signals
+            for k in range(2):
+                ts = START + k * H4
+                rows = {s: data[s].loc[ts].to_dict() for s in SYMBOLS}
+                trader.on_bar(ts, rows, {s: 100. for s in SYMBOLS}, now_ms=ts + H4 + 1000)
+            self.assertNotIn('BCHUSDT', trader.positions)
+            self.assertNotIn('BCHUSDT', trader.pending)
+
+    def test_btc_cannot_be_dropped(self):
+        """Every new short consults BTC's SMA200 regime."""
+        with self.assertRaises(ValueError):
+            LiveConfig(universe=('ETHUSDT', 'SOLUSDT'))
+
+    def test_unknown_symbol_is_refused(self):
+        with self.assertRaises(ValueError):
+            LiveConfig(universe=('BTCUSDT', 'NOSUCHUSDT'))
 
 
 class ConfigSafety(unittest.TestCase):

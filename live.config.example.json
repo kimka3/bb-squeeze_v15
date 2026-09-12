@@ -18,5 +18,19 @@
     "max_positions": 6,
     "fee": 0.0,
     "slippage": 0.0002
-  }
+  },
+  "universe": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "ADAUSDT",
+    "DOGEUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+    "AVAXUSDT"
+  ],
+  "_universe_note": "BCHUSDT excluded on cost: 44.6bp round trip = 0.383R at 100k equity",
+  "passive_take_profit": true
 }

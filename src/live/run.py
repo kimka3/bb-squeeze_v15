@@ -30,7 +30,7 @@ from live import feed                                              # noqa: E402
 
 
 def build(config: LiveConfig):
-    markets = load_markets(config.base_url, SYMBOL_TO_LIGHTER)
+    markets = load_markets(config.base_url, config.lighter_universe)
     journal = Journal(config.state_dir)
     if config.mode == 'live':
         broker = LighterBroker(config.base_url, config.account_index,
@@ -199,7 +199,7 @@ def capacity(markets, config, multiple: float = 0.86) -> None:
 
 
 def run_once(trader, markets, config) -> None:
-    frames = feed.prepare(SYMBOLS)
+    frames = feed.prepare(list(config.universe))
     bar_ms, rows = feed.latest_closed(frames)
     current = marks(config.base_url, markets)
     outcome = trader.on_bar(bar_ms, rows, current)
@@ -252,7 +252,7 @@ def main() -> int:
         return 2
 
     if a.depth_scan or a.capacity:
-        loaded = load_markets(config.base_url, SYMBOL_TO_LIGHTER)
+        loaded = load_markets(config.base_url, config.lighter_universe)
         if a.depth_scan:
             depth_scan(loaded, config, a.equity)
         if a.capacity:

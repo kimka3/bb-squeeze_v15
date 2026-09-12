@@ -54,6 +54,10 @@ class Trader:
         self.markets = markets
         self.journal = journal
         self.costs = Costs(self.cfg.fee, self.cfg.slippage)
+        # Traded universe. Excluded symbols never produce a signal here, so a
+        # position in one can only come from outside the bot — reconcile halts on it.
+        self.universe = list(config.universe)
+        self.longs = [s for s in LONGS if s in self.universe]
 
         snap = journal.load_snapshot()
         self.positions: dict[str, dict] = snap.get('positions', {})
@@ -170,7 +174,7 @@ class Trader:
         # Scanning BEFORE the exits matters: a symbol still held at that close
         # is skipped, exactly as the backtest skips it.
         # pending is derived fresh every bar, never carried across a restart.
-        self.pending, filtered = scan_signals(bar_ms, rows, SYMBOLS, LONGS,
+        self.pending, filtered = scan_signals(bar_ms, rows, self.universe, self.longs,
                                               self.positions, self.setups, self.cfg)
 
         # The new bar's open is unobservable at the moment we act, so the live
@@ -189,7 +193,7 @@ class Trader:
 
         # 2. entries in canonical order, one at a time
         entry_block = out.halted or margin.block_entries
-        for symbol in SYMBOLS:
+        for symbol in self.universe:
             req = self.pending.pop(symbol, None)
             if req is None or symbol in self.positions:
                 continue

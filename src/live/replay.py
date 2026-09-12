@@ -31,6 +31,8 @@ from data_io import H4, SYMBOLS                                     # noqa: E402
 from frontier_engine import Strategy, run                           # noqa: E402
 from trade_core import Costs, close_fill, intrabar                  # noqa: E402
 from live.broker import AccountState, Fill, OrderRef                # noqa: E402
+import data_io                                                       # noqa: E402
+import frontier_engine                                              # noqa: E402
 from live.config import LiveConfig, SYMBOL_TO_LIGHTER               # noqa: E402
 from live.journal import Journal                                    # noqa: E402
 from live.markets import Market as LiveMarket                       # noqa: E402
@@ -193,12 +195,23 @@ def compare(bars: int = 400) -> int:
     window = timeline[-bars:]
     start, end = window[0], window[-1] + H4
 
-    reference = run(market, strategy, start, end)
+    # Both sides run the SAME universe. The live config excludes BCH on cost
+    # grounds; comparing a 10-symbol bot against an 11-symbol backtest would
+    # report a difference that is configuration, not a defect.
+    universe = list(LiveConfig().universe)
+    saved_s, saved_l = frontier_engine.SYMBOLS, frontier_engine.LONGS
+    frontier_engine.SYMBOLS = universe
+    frontier_engine.LONGS = [s for s in data_io.LONGS if s in universe]
+    try:
+        reference = run(market, strategy, start, end)
+    finally:
+        frontier_engine.SYMBOLS, frontier_engine.LONGS = saved_s, saved_l
     ref_entries = [(int(t['entry_ms']), t['symbol'], t['side'], round(t['initial_qty'], 8))
                    for t in reference['trades'].to_dict('records')]
 
     with tempfile.TemporaryDirectory() as tmp:
         config = LiveConfig(mode='paper', state_dir=tmp, strategy=strategy,
+                            universe=tuple(universe),
                             max_basis_divergence_pct=1e9, min_notional_usd=0.)
         broker = ReplayBroker(market, strategy)
         trader = Trader(config, broker, fake_markets(), Journal(tmp))
@@ -206,13 +219,13 @@ def compare(bars: int = 400) -> int:
         for k in range(len(window) - 1):
             ts = window[k]            # the bar that just closed: signals come from it
             nxt = window[k + 1]       # the bar now opening: fills land here
-            rows = {s: market.rows[s][ts] for s in SYMBOLS}
-            opens = {s: float(market.rows[s][nxt]['open']) for s in SYMBOLS}
+            rows = {s: market.rows[s][ts] for s in universe}
+            opens = {s: float(market.rows[s][nxt]['open']) for s in universe}
             broker.mark(opens)
             outcome = trader.on_bar(ts, rows, opens, now_ms=ts + H4 + 1000)
             for e in outcome.entries:
                 live_entries.append((nxt, e['symbol'], e['side'], round(e['qty'], 8)))
-            broker.advance(nxt, {s: market.rows[s][nxt] for s in SYMBOLS})
+            broker.advance(nxt, {s: market.rows[s][nxt] for s in universe})
 
     ref_set = {(t, s, side) for t, s, side, _ in ref_entries}
     live_set = {(t, s, side) for t, s, side, _ in live_entries}
@@ -229,6 +242,9 @@ def compare(bars: int = 400) -> int:
             worst = max(worst, abs(a - b) / abs(a))
 
     print(f'window  {bars} bars  {window[0]} .. {window[-1]}')
+    print(f'universe {len(universe)} symbols'
+          + (f'  (excluded: {", ".join(s for s in SYMBOLS if s not in universe)})'
+             if len(universe) < len(SYMBOLS) else ''))
     print(f'backtest entries {len(ref_set)}   live entries {len(live_set)}   '
           f'matched {len(shared)}')
 

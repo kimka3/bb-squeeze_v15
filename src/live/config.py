@@ -17,6 +17,20 @@ SYMBOL_TO_LIGHTER = {
     'LTCUSDT': 'LTC', 'BCHUSDT': 'BCH', 'AVAXUSDT': 'AVAX',
 }
 
+# Excluded from live trading on COST grounds, not on backtest profit.
+# BCH round-trip slippage measured 44.6bp at 100k equity, which is 0.383R — a
+# round trip hands 38% of the 2% risk budget to the book before the trade has a
+# view. src/live/universe_study.py shows that dropping further symbols does keep
+# improving the sample, but roughly half of that gain is post-hoc selection and
+# should not be expected to repeat; BCH alone is disqualified by cost arithmetic
+# that does not reference its P&L at all.
+#
+# This is a LIVE setting. The audited backtest keeps all eleven symbols so its
+# published results stay reproducible — compare like with like by passing the
+# same universe to both (src/live/replay.py does).
+EXCLUDED = ('BCHUSDT',)
+DEFAULT_UNIVERSE = tuple(s for s in SYMBOL_TO_LIGHTER if s not in EXCLUDED)
+
 MAINNET = 'https://mainnet.zklighter.elliot.ai'
 
 # shadow  decide and journal only, never touch the exchange (default)
@@ -29,6 +43,9 @@ MODES = ('shadow', 'paper', 'live')
 class LiveConfig:
     mode: str = 'shadow'
     base_url: str = MAINNET
+
+    # Symbols actually traded. Defaults to everything except EXCLUDED.
+    universe: tuple = DEFAULT_UNIVERSE
 
     # Lighter account. account_index identifies the sub-account; the private key
     # never appears in this file — it is read from LIGHTER_API_PRIVATE_KEY.
@@ -66,9 +83,22 @@ class LiveConfig:
     def __post_init__(self):
         if self.mode not in MODES:
             raise ValueError(f'mode must be one of {MODES}')
+        self.universe = tuple(self.universe)
+        unknown = [s for s in self.universe if s not in SYMBOL_TO_LIGHTER]
+        if unknown:
+            raise ValueError(f'universe has symbols with no Lighter market: {unknown}')
+        if 'BTCUSDT' not in self.universe:
+            # Every new short consults BTC's SMA200 regime. Trading BTC is
+            # optional; having its bars is not.
+            raise ValueError('BTCUSDT must stay in the universe: the regime filter reads it')
         self.state_dir = Path(self.state_dir)
         if self.mode == 'live' and self.account_index is None:
             raise ValueError('live mode requires account_index')
+
+    @property
+    def lighter_universe(self) -> dict:
+        """SYMBOL_TO_LIGHTER restricted to what this config trades."""
+        return {s: SYMBOL_TO_LIGHTER[s] for s in self.universe}
 
     @property
     def private_key(self) -> str:
