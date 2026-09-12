@@ -123,6 +123,83 @@ def run_universe(market, symbols, base, **kw) -> dict:
             'calmar': m['cagr_pct'] / abs(dd5), 'fine': fine}
 
 
+MAJORS = ('BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT')
+
+
+def diagnose(market, universe, base, books_for, caps) -> None:
+    """Why large capital breaks this strategy, in the two ways it actually breaks.
+
+    Worth separating, because they call for different fixes: a return drag is
+    priced and survivable, a broken risk unit is not.
+    """
+    import data_io
+    import frontier_engine
+    from frontier_engine import run
+
+    def raw(symbols, **kw):
+        saved = frontier_engine.SYMBOLS, frontier_engine.LONGS
+        frontier_engine.SYMBOLS = list(symbols)
+        frontier_engine.LONGS = [s for s in data_io.LONGS if s in symbols]
+        try:
+            return run(market, base, START, END, **kw)
+        finally:
+            frontier_engine.SYMBOLS, frontier_engine.LONGS = saved
+
+    # ---- 1. who carries the notional, and whose book cannot carry it ----
+    b0 = books_for(100_000)
+    tr = raw(universe, slippage_of=b0.rate)['trades']
+    tr = tr.assign(notional=tr.initial_qty * tr.entry_price)
+    w = tr.groupby('symbol').notional.sum()
+    w = w / w.sum()
+    lo, hi = 100_000, 800_000
+    rows = [(s, w.get(s, 0.), b0.rate(s, lo) * 1e4, b0.rate(s, hi) * 1e4)
+            for s in universe]
+    inc = sum(x[1] * (x[3] - x[2]) for x in rows)
+
+    print('\n1. 자본이 커질 때 추가 비용을 누가 내는가')
+    print(f"\n{'symbol':9s}{'명목비중':>10s}{'@100k':>9s}{'@800k':>9s}"
+          f"{'배율':>7s}{'증가분 점유':>13s}")
+    print('-' * 60)
+    for s, ws, a, z in sorted(rows, key=lambda x: -(x[1] * (x[3] - x[2]))):
+        print(f'{s:9s}{ws * 100:>9.1f}%{a:>9.2f}{z:>9.2f}{z / a:>6.1f}x'
+              f'{ws * (z - a) / inc * 100:>12.1f}%')
+
+    # ---- 2. is it capacity, or is it hindsight? ----
+    flat_all = run_universe(market, universe, base)
+    flat_maj = run_universe(market, list(MAJORS), base)
+    selection = flat_maj['calmar'] - flat_all['calmar']
+
+    print('\n2. 얇은 알트를 빼면 대자본에서 살아나는가 — 그리고 그것은 비용인가')
+    print('   대조군은 일률 2bp. 비용이 같은데도 좋아지는 만큼은 사후 선택이다.')
+    print(f"\n   일률 2bp   전체 C/M {flat_all['calmar']:.3f}   "
+          f"메이저 C/M {flat_maj['calmar']:.3f}   차이 {selection:+.3f}")
+    print(f"\n{'시작자본':>10s}{'전체 CAGR':>11s}{'메이저 CAGR':>13s}"
+          f"{'전체 C/M':>10s}{'메이저 C/M':>11s}{'비용 성분':>11s}")
+    print('-' * 68)
+    for cap in caps:
+        a = run_universe(market, universe, base, slippage_of=books_for(cap).rate)
+        m = run_universe(market, list(MAJORS), base, slippage_of=books_for(cap).rate)
+        print(f"{cap:>10,}{a['cagr']:>10.2f}%{m['cagr']:>12.2f}%"
+              f"{a['calmar']:>10.3f}{m['calmar']:>11.3f}"
+              f"{m['calmar'] - a['calmar'] - selection:>+11.3f}")
+
+    # ---- 3. does the risk unit survive? ----
+    print('\n3. 위험모형이 버티는가 — 손절은 설계상 -1R이다')
+    print(f"\n{'비용 모델':18s}{'평균 손실R':>12s}{'최악 R':>9s}"
+          f"{'-1R 초과':>10s}{'평균 이익R':>12s}{'승/패':>8s}")
+    print('-' * 70)
+    for label, cap in [('일률 2bp', None)] + [(f'@{c // 1000:,.0f}k', c) for c in caps]:
+        kw = {} if cap is None else {'slippage_of': books_for(cap).rate}
+        t = raw(universe, **kw)['trades']
+        lose, win = t[t.r_multiple < 0].r_multiple, t[t.r_multiple > 0].r_multiple
+        print(f'{label:18s}{lose.mean():>12.3f}{lose.min():>9.2f}'
+              f'{(lose < -1).mean() * 100:>9.0f}%{win.mean():>12.3f}'
+              f'{abs(win.mean() / lose.mean()):>8.3f}')
+    print('\n손실만 커지고 이익은 그대로다. 이익은 진입에서 멀리 떨어진 추적청산까지')
+    print('달리므로 비용이 작은 비중이지만, 손실은 정확히 1R 자리에서 잘리기 때문이다.')
+    print('그래서 낙폭이 수익 감소보다 빠르게 나빠진다 — 위험단위 자체가 무너진 것이다.')
+
+
 def main(args) -> int:
     from run_frontier import market_data
 
@@ -207,6 +284,10 @@ def main(args) -> int:
     print(f'최종자산 {a["final"]:,.0f} → {c["final"]:,.0f} '
           f'({c["final"] / a["final"] - 1:+.1%})')
 
+    if args.diagnose:
+        diagnose(market, universe, base,
+                 lambda c: Books(args.books, args.multiple, c), args.capitals)
+
     print('\n한계: 호가 스냅샷 1회다. 시간대·변동성에 따라 달라진다. 자기 주문이')
     print('남기는 가격 충격과 4시간봉 사이의 가격 변화는 포함하지 않았다.')
     print('펀딩은 Binance 실측이며 Lighter의 시간당 펀딩과 다르다.')
@@ -222,6 +303,12 @@ if __name__ == '__main__':
                          '100k, this scales every book walk to match')
     ap.add_argument('--fixed', type=float, nargs='*',
                     default=[100_000., 200_000.])
+    ap.add_argument('--diagnose', action='store_true',
+                    help='why large capital breaks it: cost attribution, the '
+                         'thin-alt counterfactual with a selection control, and '
+                         'whether the 1R risk unit survives')
+    ap.add_argument('--capitals', type=float, nargs='*',
+                    default=[100_000., 400_000., 1_000_000., 2_000_000.])
     ap.add_argument('--curve', type=float, nargs='*',
                     default=[100_000., 200_000., 400_000., 800_000.])
     raise SystemExit(main(ap.parse_args()))
