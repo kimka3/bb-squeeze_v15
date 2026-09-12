@@ -125,6 +125,62 @@ def run_universe(market, symbols, base, **kw) -> dict:
 
 MAJORS = ('BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT')
 
+# Thinnest book first. Lighter's ten split cleanly into five markets under $1.5M
+# of visible bid depth and five over $7.5M — a five-fold gap with nothing in it,
+# so the interesting cuts are inside the thin layer.
+BY_DEPTH = ('ADAUSDT', 'LTCUSDT', 'DOGEUSDT', 'LINKUSDT', 'AVAXUSDT')
+
+
+def ladder(market, universe, base, books_for, caps) -> None:
+    """Every plausible exclusion set, priced at every capital.
+
+    Each row also carries what the same cut is worth at a FLAT 2bp, which is the
+    only way to tell a capacity decision from hindsight: if a cut helps when cost
+    is held equal, that part of it is knowing which symbols did well.
+    """
+    sets = {
+        '10종목 (현재 기본)': list(universe),
+        '9종목 -LTC': [s for s in universe if s != 'LTCUSDT'],
+        '7종목 -LTC,AVAX,LINK': [s for s in universe
+                                 if s not in ('LTCUSDT', 'AVAXUSDT', 'LINKUSDT')],
+        '6종목 +ADA 제외': [s for s in universe
+                          if s not in ('LTCUSDT', 'AVAXUSDT', 'LINKUSDT', 'ADAUSDT')],
+        '5종목 (메이저만)': [s for s in universe if s in MAJORS],
+    }
+    flat = {n: run_universe(market, u, base) for n, u in sets.items()}
+    b0 = flat['10종목 (현재 기본)']['calmar']
+
+    print('\n대조군 (일률 2bp) — 비용이 같을 때도 좋아지면 그만큼은 사후 선택이다')
+    print(f"\n{'유니버스':22s}{'CAGR':>9s}{'MDD':>10s}{'Calmar':>9s}"
+          f"{'거래':>7s}{'선택성분':>10s}")
+    print('-' * 68)
+    for n in sets:
+        r = flat[n]
+        print(f"{n:22s}{r['cagr']:>8.2f}%{r['mdd5m']:>9.2f}%{r['calmar']:>9.3f}"
+              f"{r['trades']:>7d}{r['calmar'] - b0:>+10.3f}")
+
+    grid = {}
+    for n, uni in sets.items():
+        for cap in caps:
+            b = books_for(cap)
+            grid[n, cap] = (run_universe(market, uni, base, slippage_of=b.rate),
+                            bool(b.exhausted))
+
+    for key, label, fmt in (('cagr', 'CAGR', '{:>+9.2f}'),
+                            ('mdd5m', 'MDD(5분)', '{:>9.2f}'),
+                            ('calmar', 'Calmar', '{:>9.2f}')):
+        print(f'\n{label} — 자산연동 실측 슬리피지\n')
+        print(f"{'유니버스':22s}" + ''.join(f'{c // 1000:>10.0f}k' for c in caps))
+        print('-' * (22 + 11 * len(caps)))
+        for n in sets:
+            cells = ''.join(fmt.format(grid[n, c][0][key]) + ('*' if grid[n, c][1] else ' ')
+                            for c in caps)
+            print(f'{n:22s}{cells}')
+    print('\n* = 보이는 호가가 바닥난 구간이 있어 실제는 더 나쁨 (하한값)')
+    print('\n정적 bp표는 시작 자본 크기로 잰 값이라 가장 얇은 종목을 과소평가한다.')
+    print('실행 중 자산이 불어나 포지션은 그보다 훨씬 커진다 — 시작 400k에서도')
+    print('포지션 명목 중앙값이 68만 달러, 최대 365만 달러다.')
+
 
 def diagnose(market, universe, base, books_for, caps) -> None:
     """Why large capital breaks this strategy, in the two ways it actually breaks.
@@ -284,6 +340,10 @@ def main(args) -> int:
     print(f'최종자산 {a["final"]:,.0f} → {c["final"]:,.0f} '
           f'({c["final"] / a["final"] - 1:+.1%})')
 
+    if args.ladder:
+        ladder(market, universe, base,
+               lambda c: Books(args.books, args.multiple, c), args.capitals)
+
     if args.diagnose:
         diagnose(market, universe, base,
                  lambda c: Books(args.books, args.multiple, c), args.capitals)
@@ -303,6 +363,10 @@ if __name__ == '__main__':
                          '100k, this scales every book walk to match')
     ap.add_argument('--fixed', type=float, nargs='*',
                     default=[100_000., 200_000.])
+    ap.add_argument('--ladder', action='store_true',
+                    help='every plausible exclusion set at every capital, with '
+                         'the flat-cost control that separates capacity from '
+                         'hindsight')
     ap.add_argument('--diagnose', action='store_true',
                     help='why large capital breaks it: cost attribution, the '
                          'thin-alt counterfactual with a selection control, and '
