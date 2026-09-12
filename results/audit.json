@@ -1,0 +1,8 @@
+{
+  "scenarios_checked": 8,
+  "full_5m_paths": true,
+  "endpoints_mdd_fill_quantity_fees_funding_cash_reconciled": true,
+  "baseline_matches_previous_A": true,
+  "cap_unit_tests_passed": 5,
+  "raw_data_rebuild": true
+}
