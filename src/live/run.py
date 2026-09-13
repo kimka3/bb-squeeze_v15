@@ -42,6 +42,7 @@ from live.markets import load_markets, marks                       # noqa: E402
 from live.trader import Trader                                     # noqa: E402
 from live import feed                                              # noqa: E402
 from live import observation                                       # noqa: E402
+from live.runtime_health import RuntimeHealth                      # noqa: E402
 
 STOP_REQUESTED = threading.Event()
 
@@ -256,7 +257,7 @@ def prepare_frames(config):
                         timeout=config.request_timeout_seconds, retries=config.feed_retries)
 
 
-def run_once(trader, markets, config, frames=None, deadline=float('inf')):
+def run_once(trader, markets, config, frames=None, deadline=float('inf'), coverage=None):
     frames = prepare_frames(config) if frames is None else frames
     bar_ms, rows = feed.latest_closed(frames)
     current = marks(config.base_url, markets)
@@ -264,9 +265,19 @@ def run_once(trader, markets, config, frames=None, deadline=float('inf')):
         return None
     now_ms = int(time.time() * 1000)
     late = now_ms - (bar_ms + H4) > config.bar_grace_seconds * 1000
+    already_processed = bar_ms <= getattr(trader, 'last_bar_ms', -1)
     # Late bars may restore indicators / manage existing positions, never open
     # the missed signal at an unrelated later price.
     outcome = trader.on_bar(bar_ms, rows, current, now_ms=now_ms, allow_entries=not late)
+    if coverage is not None and not already_processed:
+        if getattr(trader, 'last_bar_ms', -1) == bar_ms:
+            # The guard also includes HALT/margin conditions: this is a count
+            # blocked while late, not an attribution of losses to delay alone.
+            blocked = sum(why == 'entries blocked by guard' for _, why in outcome.skipped)
+            coverage.bar(bar_ms, now_ms, blocked_candidates=blocked if late else 0)
+        else:
+            trader.journal.append('bar_error', error='decision returned before bar was processed')
+            coverage.failure('bar', now_ms, 'decision returned before bar was processed')
     stamp = time.strftime('%Y-%m-%d %H:%M', time.gmtime(bar_ms / 1000))
     print(f'[{config.mode}] bar {stamp}Z  equity {outcome.equity:,.2f}  '
           f'positions {len(trader.positions)}')
@@ -288,6 +299,15 @@ def next_boundary(now_ms: int) -> int:
     return (now_ms // H4 + 1) * H4
 
 
+def bar_retry_seconds(failures: int) -> float:
+    """Retry transient closed-bar publication failures independently of polls.
+
+    The entry grace is unchanged. Bounded backoff also prevents a busy loop when
+    the source remains unavailable; a late recovered bar still cannot enter.
+    """
+    return float(min(30, 5 * 2 ** min(max(failures - 1, 0), 3)))
+
+
 def parse_until(text: str) -> float:
     """ISO 8601 instant -> unix seconds. Naive input is read as UTC, because every
     other clock in this system is UTC and a silent local-time reading would end a
@@ -298,8 +318,12 @@ def parse_until(text: str) -> float:
     return t.timestamp()
 
 
-def persist_report(trader, config, **health) -> None:
+def persist_report(trader, config, coverage=None, **health) -> None:
     now_ms = int(time.time() * 1000)
+    runtime_coverage = None
+    if coverage is not None:
+        coverage.save(now_ms)
+        runtime_coverage = coverage.snapshot()
     if isinstance(trader.broker, PaperBroker):
         payload = trader.broker.measurements()
         payload.update({'updated_ms': now_ms, 'mode': 'paper',
@@ -309,7 +333,12 @@ def persist_report(trader, config, **health) -> None:
                         'trader_halted': bool(getattr(trader, 'halted', False)),
                         'halt_reasons': list(getattr(trader, 'halt_reasons', [])),
                         'config': config.describe()})
-        if payload['strategy_data_gaps']:
+        # Preserve the broker's narrower accounting assessment separately.
+        payload['ledger_performance_complete'] = payload['performance_complete']
+        payload['runtime_coverage'] = runtime_coverage
+        payload['observation_coverage_complete'] = (
+            runtime_coverage['coverage_complete'] if runtime_coverage is not None else None)
+        if payload['strategy_data_gaps'] or runtime_coverage is None or not runtime_coverage['coverage_complete']:
             payload['performance_complete'] = False
         atomic_json(config.state_dir / 'report.json', payload)
     atomic_json(config.state_dir / 'runner_status.json', {
@@ -320,6 +349,7 @@ def persist_report(trader, config, **health) -> None:
         'pending_operation': getattr(trader, 'pending_operation', None),
         'residual_exits': getattr(trader, 'residual_exits', {}),
         'data_gaps': list(getattr(trader, 'data_gaps', [])),
+        'runtime_coverage': runtime_coverage,
         **health})
 
 
@@ -342,6 +372,8 @@ def run_loop(trader, markets, config, deadline: float) -> None:
         counters.update({k: old[k] for k in counters if k in old})
     counters['session_started_ms'] = int(time.time() * 1000)
     counters['counter_scope'] = 'cumulative_for_state_directory'
+    coverage = RuntimeHealth(config.state_dir, trader.journal, config.bar_grace_seconds)
+    consecutive_bar_errors = 0
     try:
         while time.time() < deadline and not STOP_REQUESTED.is_set():
             now = time.time()
@@ -349,15 +381,30 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                 bar_future = pool.submit(prepare_frames, config)
             if bar_future is not None and bar_future.done():
                 try:
-                    outcome = run_once(trader, markets, config, bar_future.result(), deadline=deadline)
+                    prepared = bar_future.result()
+                    outcome = run_once(trader, markets, config, prepared, deadline=deadline,
+                                       coverage=coverage)
                     if outcome is not None:
-                        counters['last_bar_success_ms'] = int(time.time() * 1000)
-                    next_bar_at = next_boundary(int(time.time() * 1000)) / 1000 + min(5, config.bar_grace_seconds / 4)
+                        requested_bar_ms, _ = feed.latest_closed(prepared)
+                        if trader.last_bar_ms >= requested_bar_ms:
+                            counters['last_bar_success_ms'] = int(time.time() * 1000)
+                            coverage.success('bar', counters['last_bar_success_ms'])
+                        # A pinned read can finish across a boundary. Schedule
+                        # from its data timestamp so the new bar is not skipped.
+                        next_bar_at = ((requested_bar_ms + 2 * H4) / 1000
+                                       + min(5, config.bar_grace_seconds / 4))
+                    else:
+                        next_bar_at = next_boundary(int(time.time() * 1000)) / 1000
+                    consecutive_bar_errors = 0
+                    counters['next_bar_retry_ms'] = None
                 except Exception as exc:
                     counters['bar_errors'] += 1
                     counters['last_error'] = f'bar: {exc}'
                     trader.journal.append('bar_error', error=str(exc))
-                    next_bar_at = time.time() + config.poll_seconds
+                    coverage.failure('bar', int(time.time() * 1000), str(exc))
+                    consecutive_bar_errors += 1
+                    next_bar_at = time.time() + bar_retry_seconds(consecutive_bar_errors)
+                    counters['next_bar_retry_ms'] = int(next_bar_at * 1000)
                 bar_future = None
             now = time.time()
             if now >= deadline or STOP_REQUESTED.is_set():
@@ -371,20 +418,24 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                             print(f'SIMULATED FILL {fill.symbol} {fill.role} qty={fill.qty} price={fill.price}', flush=True)
                     counters['successful_polls'] += 1
                     counters['last_successful_poll_ms'] = int(time.time() * 1000)
+                    coverage.success('poll', counters['last_successful_poll_ms'])
                 except Exception as exc:
                     poll_failed = True
                     counters['poll_errors'] += 1
                     counters['last_error'] = f'poll: {exc}'
                     trader.journal.append('poll_error', error=str(exc))
+                    coverage.failure('poll', int(time.time() * 1000), str(exc))
                 # Earlier fills can be persisted before a later poll request
                 # fails. Reconcile them without stale-price close retries.
                 try:
                     trader.service(marks={} if poll_failed else None)
+                    coverage.success('service', int(time.time() * 1000))
                 except Exception as exc:
                     counters['last_error'] = f'service: {exc}'
                     trader.journal.append('service_error', error=str(exc))
+                    coverage.failure('service', int(time.time() * 1000), str(exc))
                 next_poll_at = time.time() + config.poll_seconds
-                persist_report(trader, config, **counters)
+                persist_report(trader, config, coverage=coverage, **counters)
             now = time.time()
             if now >= deadline or STOP_REQUESTED.is_set():
                 break
@@ -395,10 +446,12 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                     observation.save(config.state_dir, sample_future.result())
                     counters['observations'] += 1
                     counters['last_observation_ms'] = int(time.time() * 1000)
+                    coverage.success('observation', counters['last_observation_ms'])
                 except Exception as exc:
                     counters['observation_errors'] += 1
                     counters['last_error'] = f'observation: {exc}'
                     trader.journal.append('observation_error', error=str(exc))
+                    coverage.failure('observation', int(time.time() * 1000), str(exc))
                 sample_future = None
                 next_sample_at = time.time() + config.observation_seconds
             STOP_REQUESTED.wait(max(0, min(1, deadline - time.time())))
@@ -407,7 +460,7 @@ def run_loop(trader, markets, config, deadline: float) -> None:
         # workers, so a supervisor timeout cannot discard the final ledger.
         if isinstance(trader.broker, PaperBroker):
             trader.broker.save()
-        persist_report(trader, config, **counters)
+        persist_report(trader, config, coverage=coverage, **counters)
         pool.shutdown(wait=True, cancel_futures=True)
 
 
