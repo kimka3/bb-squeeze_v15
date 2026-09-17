@@ -1,0 +1,452 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  BB Squeeze v15 "Candidate-A" + risk-2% override
+//  bb_squeeze_lighter_bot_risk2 v0.2.0 (2026-09-11) 의 Pine Script 이식본
+//
+//  원본: src/bb_lighter/strategy.py  (지표·신호·사이징)
+//        src/bb_lighter/engine.py    (_manage_positions_on_close / _install_protection)
+//        config.example.yaml         (파라미터 기본값)
+//
+//  ── 반드시 4시간(4H) 차트에 적용한다. ────────────────────────────────────
+//
+//  ⚠ 이 스크립트는 "단일 심볼" 전략이다. 원 봇은 11개 숏 유니버스 + 3개 롱
+//    유니버스를 하나의 계좌에서 굴리며 4% 공유 초기위험 / 5배 총명목 / 동시
+//    6포지션 한도를 심볼 간에 공유한다. TradingView 전략은 심볼당 독립 실행
+//    이므로 그 교차-심볼 한도는 재현되지 않는다. 자세한 차이는 파일 하단의
+//    "원본과의 차이" 주석과 docs/pine_port_notes.md 참고.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy(
+     title                   = "BB Squeeze v15 Candidate-A (risk 2%) — Lighter bot port",
+     shorttitle              = "BBSQ v15-A r2",
+     overlay                 = true,
+     pyramiding              = 0,
+     initial_capital         = 1000,
+     currency                = currency.USD,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false,
+     close_entries_rule      = "ANY",
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.05,
+     slippage                = 0,
+     margin_long             = 20,
+     margin_short            = 20,
+     max_bars_back           = 1000,
+     max_labels_count        = 500)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 0. 입력값  (기본값 = config.example.yaml 의 strategy: 섹션)
+// ───────────────────────────────────────────────────────────────────────────
+G_SIG  = "1) 신호 지표"
+G_ENT  = "2) 진입 규칙"
+G_EXI  = "3) 청산·보호 규칙"
+G_RSK  = "4) 위험·수량"
+G_VEN  = "5) 거래소 제약 (선택)"
+G_VIS  = "6) 표시"
+
+bbLen       = input.int(20,    "BB 길이",                        minval=2,   group=G_SIG)
+bbStdMult   = input.float(2.0, "BB 표준편차 배수",                minval=0.1, step=0.1, group=G_SIG)
+atrLen      = input.int(14,    "ATR 길이 (Wilder)",              minval=1,   group=G_SIG)
+smaLen      = input.int(200,   "추세 SMA 길이",                   minval=2,   group=G_SIG)
+slopeBars   = input.int(5,     "SMA 기울기 비교 봉수",             minval=1,   group=G_SIG)
+pctLook     = input.int(120,   "백분위 lookback",                 minval=2,   group=G_SIG)
+bbwPctMax   = input.float(0.20,"BBW 백분위 상한",  minval=0, maxval=1, step=0.01, group=G_SIG)
+atrPctMax   = input.float(0.30,"ATR% 백분위 상한", minval=0, maxval=1, step=0.01, group=G_SIG)
+sqWindow    = input.int(5,     "squeeze 관측창 (직전 N봉)",        minval=1,   group=G_SIG)
+sqMinBars   = input.int(3,     "squeeze 최소 충족 봉수",           minval=1,   group=G_SIG)
+expLook     = input.int(3,     "expansion 비교 봉수",              minval=1,   group=G_SIG)
+minGrowth   = input.float(0.12,"최소 BBW 증가율",   minval=0, step=0.01,        group=G_SIG)
+
+enableLong  = input.bool(true, "롱 사용 (원본 유니버스: BTC/ETH/SOL)", group=G_ENT)
+enableShort = input.bool(true, "숏 사용 (원본 유니버스: BTC/ETH/SOL/BNB/XRP/ADA/DOGE/LINK/LTC/BCH/AVAX)", group=G_ENT)
+retestBars  = input.int(3,     "롱 retest 유효 봉수",              minval=1,   group=G_ENT)
+retestTol   = input.float(0.005,"롱 retest 저가 허용오차", minval=0, step=0.001, group=G_ENT)
+
+longStopATR  = input.float(1.5, "롱 초기 손절 (× 신호봉 ATR)",  minval=0.1, step=0.1, group=G_EXI)
+longMaxBars  = input.int(180,   "롱 최대 보유 봉수",             minval=1,   group=G_EXI)
+shortStopATR = input.float(1.0, "숏 초기 손절 (× 신호봉 ATR)",  minval=0.1, step=0.1, group=G_EXI)
+shortTpR     = input.float(2.0, "숏 부분익절 (R 배수)",          minval=0.1, step=0.1, group=G_EXI)
+shortPartial = input.float(0.50,"숏 부분익절 비중", minval=0, maxval=1, step=0.05, group=G_EXI)
+shortTrailATR= input.float(2.0, "숏 추적손절 (최저저가 + × 현재 ATR)", minval=0.1, step=0.1, group=G_EXI)
+shortMaxBars = input.int(90,    "숏 최대 보유 봉수",             minval=1,   group=G_EXI)
+
+baseRisk    = input.float(0.02, "거래당 기본 위험 (2% 오버라이드)", minval=0.0001, maxval=0.02, step=0.0005, group=G_RSK)
+bullMult    = input.float(0.50, "BTC bullish 시 신규 숏 위험 배수", minval=0.01, maxval=1.0, step=0.05, group=G_RSK)
+maxTotRisk  = input.float(0.04, "총 초기위험 한도",   minval=0.0001, maxval=0.04, step=0.005, group=G_RSK)
+maxGross    = input.float(5.0,  "총 명목 노출 배수 한도", minval=0.1, step=0.5,   group=G_RSK)
+minFillFrac = input.float(0.10, "한도축소 최소 체결 비율", minval=0, maxval=1, step=0.01, group=G_RSK)
+useCompound = input.bool(true,  "복리 (strategy.equity 사용)",                     group=G_RSK)
+equityCap   = input.float(1000000000.0, "전략 사용자산 상한 (strategy_equity_cap_usdc)", minval=1, group=G_RSK)
+btcSymbol   = input.symbol("BINANCE:BTCUSDT", "BTC 국면 기준 심볼",                group=G_RSK)
+applyBtcFlt = input.bool(true,  "BTC SMA200 국면 필터 적용 (신규 숏만)",            group=G_RSK)
+entrySlip   = input.float(0.003,"사이징용 진입 슬리피지 추정", minval=0, step=0.0005, group=G_RSK)
+
+qtyStep     = input.float(0.0,  "수량 step (0 = 미적용)", minval=0, step=0.0001, group=G_VEN)
+minQty      = input.float(0.0,  "최소 주문 수량",          minval=0, step=0.0001, group=G_VEN)
+minNotional = input.float(0.0,  "최소 주문 명목금액",      minval=0, step=1,      group=G_VEN)
+rejectTiny  = input.bool(true,  "숏 절반익절 수량 < 최소수량이면 진입 거절",        group=G_VEN)
+
+showBands   = input.bool(true,  "BB / SMA200 표시",  group=G_VIS)
+showSqueeze = input.bool(true,  "squeeze 배경 표시", group=G_VIS)
+showStop    = input.bool(true,  "현재 손절선 표시",  group=G_VIS)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 1. 헬퍼
+// ───────────────────────────────────────────────────────────────────────────
+
+// pandas: series.rolling(N, min_periods=N).apply(sum(v <= last) / len)
+//  - 현재 값을 '포함'하고 '<=' 비교 (동률 포함) → 최소값은 1/N
+//  - 창 안 N개가 모두 유효할 때만 값이 나온다 (min_periods=N)
+f_pct_rank(float src, int len) =>
+    float out = na
+    if bar_index >= len - 1 and not na(src)
+        float valid = 0.0
+        float le    = 0.0
+        for i = 0 to len - 1
+            float v = src[i]
+            if not na(v)
+                valid += 1.0
+                if v <= src
+                    le += 1.0
+        out := valid == len ? le / valid : na
+    out
+
+// pandas: series.ewm(alpha=1/N, adjust=False, min_periods=N).mean()
+//  - adjust=False 의 시드는 '첫 값'이다 (ta.rma 의 SMA 시드와 다르다)
+f_wilder_adjust_false(float src, int len) =>
+    float a  = 1.0 / len
+    float st = na
+    st := na(st[1]) ? src : (1.0 - a) * st[1] + a * src
+    st
+
+f_floor_step(float v, float step) =>
+    step <= 0 or na(v) ? v : math.floor(v / step) * step
+
+// ───────────────────────────────────────────────────────────────────────────
+// 2. 지표  (strategy.add_indicators 그대로)
+// ───────────────────────────────────────────────────────────────────────────
+bbMid = ta.sma(close, bbLen)
+bbSd  = ta.stdev(close, bbLen, true)            // biased=true → 모집단 표준편차 (ddof=0)
+bbUp  = bbMid + bbStdMult * bbSd
+bbLo  = bbMid - bbStdMult * bbSd
+bbw   = bbMid != 0 ? (bbUp - bbLo) / bbMid : na
+
+trRaw  = ta.tr(true)                            // 첫 봉은 high-low (pandas 와 동일)
+atrRaw = f_wilder_adjust_false(trRaw, atrLen)
+atr    = bar_index >= atrLen - 1 ? atrRaw : na  // min_periods=14
+atrPct = close != 0 ? atr / close : na
+
+sma200   = ta.sma(close, smaLen)
+smaSlope = sma200 - sma200[slopeBars]
+
+bbwRank = f_pct_rank(bbw,    pctLook)
+atrRank = f_pct_rank(atrPct, pctLook)
+
+coreSqueeze = not na(bbwRank) and not na(atrRank) and bbwRank <= bbwPctMax and atrRank <= atrPctMax
+// 현재 봉을 제외한 '직전 sqWindow 봉' 중 sqMinBars 개 이상
+float priorSq = bar_index > 0 and coreSqueeze[1] ? 1.0 : 0.0
+float sqCount = math.sum(priorSq, sqWindow)
+sqReady = bar_index >= sqWindow and nz(sqCount, 0.0) >= sqMinBars
+
+bbwGrowth   = bbw / bbw[expLook] - 1.0
+expansionOk = not na(bbwGrowth) and bbwGrowth >= minGrowth and not na(bbw[1]) and bbw > bbw[1]
+
+warmupOk = not na(sma200) and not na(smaSlope) and not na(atr) and not na(bbwRank) and not na(atrRank)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 3. 신호
+// ───────────────────────────────────────────────────────────────────────────
+// 숏 변형 09_EXP_SLOPE = squeeze & 하단이탈 & SMA200 아래 & expansion & 기울기 음수
+shortBreakout = close < bbLo and close < sma200
+shortSlopeOk  = smaSlope < 0
+shortSignal   = warmupOk and sqReady and shortBreakout and expansionOk and shortSlopeOk
+
+// 롱 breakout = squeeze & expansion & 상단돌파 & SMA200 위 & 기울기 양수  (진입 아님)
+longBreakout  = warmupOk and sqReady and expansionOk and close > bbUp and close > sma200 and smaSlope > 0
+
+// ── 롱 RETEST_3 상태기계 (LongRetestTracker / _generate_intents 와 동일)
+var float lsRef       = na
+var int   lsRemaining = 0
+bool longRetestSignal = false
+bool inPosNow         = strategy.position_size != 0
+
+if inPosNow
+    // 포지션 보유 중이면 setup 을 폐기한다 (원본: symbol in positions → delete_setup)
+    lsRef       := na
+    lsRemaining := 0
+else if longBreakout
+    // breakout 봉 자체로는 진입하지 않는다. setup 을 새로 만들거나 갱신한다.
+    lsRef       := bbUp
+    lsRemaining := retestBars
+else if not na(lsRef) and lsRemaining > 0
+    bool retestOk = low <= lsRef * (1.0 + retestTol) and close > lsRef and close > open and close > sma200 and smaSlope > 0
+    if retestOk
+        longRetestSignal := not na(atr)
+        lsRef            := na
+        lsRemaining      := 0
+    else
+        lsRemaining := lsRemaining - 1
+        if lsRemaining <= 0
+            lsRef := na
+
+// ── BTC 국면 (신규 숏 위험 절반)
+[btcClose, btcSma] = request.security(btcSymbol, timeframe.period, [close, ta.sma(close, smaLen)], lookahead = barmerge.lookahead_off)
+bool btcDataOk = not na(btcClose) and not na(btcSma)
+// 데이터가 없으면 '보수적으로' bullish 취급 = 위험 축소
+bool btcBull   = applyBtcFlt and (btcDataOk ? btcClose >= btcSma : true)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 4. 사이징  (strategy.size_order)
+// ───────────────────────────────────────────────────────────────────────────
+float eqRaw = useCompound ? strategy.equity : strategy.initial_capital
+float E     = math.min(eqRaw, equityCap)
+
+// 단일 심볼 백테스트에서는 동시에 열린 다른 포지션이 없으므로
+// 사용중 위험 / 사용중 명목 = 0, 보유 포지션 수 = 0 이다.
+f_size(float riskPct, float stopDist, float estPrice, bool isShort) =>
+    float qty      = 0.0
+    string reason  = ""
+    float desired  = na
+    if na(stopDist) or stopDist <= 0 or na(estPrice) or estPrice <= 0 or E <= 0
+        reason := "invalid_inputs"
+    else
+        desired         := E * riskPct / stopDist
+        float availRisk = E * maxTotRisk                      // - 기존 포지션 잔여위험(=0)
+        float availNot  = E * maxGross                        // - 기존 총명목(=0)
+        float qByRisk   = availRisk / stopDist
+        float qByGross  = availNot  / estPrice
+        qty := math.min(desired, math.min(qByRisk, qByGross))
+        if qty <= 0
+            reason := "no_capacity"
+        else if qty < desired * minFillFrac
+            reason := "cap_below_minimum_fill"                // 한도축소분이 목표의 10% 미만 → 거절
+        else
+            qty := f_floor_step(qty, qtyStep)
+            if qty <= 0
+                reason := "rounded_to_zero"
+            else if qty < minQty
+                reason := "below_minimum_quantity"
+            else if qty * estPrice < minNotional
+                reason := "below_minimum_notional"
+            else if isShort and rejectTiny and minQty > 0 and f_floor_step(qty * shortPartial, qtyStep) < minQty
+                reason := "partial_tp_below_minimum"
+    [reason == "" ? qty : 0.0, reason, desired]
+
+// ───────────────────────────────────────────────────────────────────────────
+// 5. 포지션 상태
+// ───────────────────────────────────────────────────────────────────────────
+var int   posEntryBar   = na
+var float posEntryPrice = na
+var float posAtr        = na     // 신호봉 ATR (손절거리·익절가 기준, 고정)
+var float posStopDist   = na
+var float posCurStop    = na
+var float posTpPrice    = na
+var float posInitQty    = na
+var float posLowestLow  = na
+var bool  posPartial    = false
+var int   posDir        = 0
+var int   posBars       = 0
+
+// 신호봉에서 확정해 다음 봉 시가 진입에 사용할 값
+var float pendAtr = na
+var int   pendDir = 0
+
+bool inPos       = strategy.position_size != 0
+bool justEntered = inPos and strategy.position_size[1] == 0
+
+if justEntered
+    posEntryBar   := bar_index
+    posEntryPrice := strategy.position_avg_price
+    posAtr        := pendAtr
+    posDir        := strategy.position_size > 0 ? 1 : -1
+    posStopDist   := (posDir > 0 ? longStopATR : shortStopATR) * posAtr
+    posCurStop    := posDir > 0 ? posEntryPrice - posStopDist : posEntryPrice + posStopDist
+    posTpPrice    := posDir < 0 ? posEntryPrice - shortTpR * shortStopATR * posAtr : na
+    posInitQty    := math.abs(strategy.position_size)
+    posLowestLow  := posDir < 0 ? posEntryPrice : na
+    posPartial    := false
+    posBars       := 0
+
+if not inPos
+    posDir       := 0
+    posBars      := 0
+    posPartial   := false
+    posCurStop   := na
+    posLowestLow := na
+
+// ───────────────────────────────────────────────────────────────────────────
+// 6. 확정봉 포지션 관리  (_manage_positions_on_close)
+// ───────────────────────────────────────────────────────────────────────────
+string exitReason = ""
+
+if inPos
+    posBars := na(posEntryBar) ? posBars : bar_index - posEntryBar + 1   // 진입봉 종가에 1
+
+    // 부분익절 체결 감지 → 손절을 손익분기점보다 불리하게 두지 않는다
+    if posDir < 0 and math.abs(strategy.position_size) < posInitQty * 0.999
+        posPartial := true
+
+    if posDir > 0
+        if close < bbMid
+            exitReason := "LONG_BB_MID"
+        else if posBars >= longMaxBars
+            exitReason := "LONG_TIME"
+    else
+        posLowestLow := math.min(nz(posLowestLow, posEntryPrice), low)
+        float cand    = na(atr) ? na : posLowestLow + shortTrailATR * atr
+        float newStop = na(cand) ? posCurStop : math.min(posCurStop, cand)
+        if posPartial
+            newStop := math.min(newStop, posEntryPrice)      // breakeven 이하로만
+        if not na(newStop) and newStop < posCurStop
+            posCurStop := newStop                            // 절대 느슨해지지 않는다
+        if posBars >= shortMaxBars
+            exitReason := "SHORT_TIME"
+
+// ── 보호 주문 (서버측 reduce-only stop / take-profit 에 해당)
+if inPos
+    if posDir > 0
+        strategy.exit("L-X", from_entry = "L", stop = posCurStop, comment = "LONG STOP")
+    else
+        if not posPartial and not na(posTpPrice)
+            float tpQty = f_floor_step(posInitQty * shortPartial, qtyStep)
+            if tpQty > 0
+                strategy.exit("S-TP", from_entry = "S", qty = tpQty, limit = posTpPrice, comment = "SHORT TP 2R")
+        strategy.exit("S-X", from_entry = "S", stop = posCurStop, comment = "SHORT STOP")
+
+    if exitReason != ""
+        strategy.close_all(comment = exitReason)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 7. 진입  (신호봉 종가 확정 → 다음 봉 시가 시장가)
+// ───────────────────────────────────────────────────────────────────────────
+bool wantShort = enableShort and shortSignal and not na(atr)
+bool wantLong  = enableLong  and longRetestSignal and not na(atr)
+bool conflict  = wantShort and wantLong          // 같은 심볼 롱/숏 동시 → 둘 다 건너뜀
+
+float plannedQty = na
+string rejectWhy = ""
+
+if strategy.position_size == 0 and exitReason == "" and not conflict
+    if wantShort
+        float riskPct  = btcBull ? baseRisk * bullMult : baseRisk
+        float stopDist = shortStopATR * atr
+        float estPx    = close * (1.0 + entrySlip)
+        [q, why, _d1]  = f_size(riskPct, stopDist, estPx, true)
+        plannedQty     := q
+        rejectWhy      := why
+        if q > 0
+            pendAtr := atr
+            pendDir := -1
+            strategy.entry("S", strategy.short, qty = q, comment = "SHORT " + str.tostring(riskPct * 100, "#.##") + "%")
+            // 진입봉부터 보호되도록 신호봉 종가 기준 임시 보호주문을 함께 낸다.
+            // 다음 봉 종가에 실제 평균진입가 기준으로 갱신된다.
+            float pStop = close + stopDist
+            float pTp   = close - shortTpR * stopDist
+            float pTpQ  = f_floor_step(q * shortPartial, qtyStep)
+            if pTpQ > 0
+                strategy.exit("S-TP", from_entry = "S", qty = pTpQ, limit = pTp, comment = "SHORT TP 2R")
+            strategy.exit("S-X",  from_entry = "S", stop = pStop, comment = "SHORT STOP")
+
+    else if wantLong
+        float riskPctL  = baseRisk
+        float stopDistL = longStopATR * atr
+        float estPxL    = close * (1.0 + entrySlip)
+        [qL, whyL, _d2] = f_size(riskPctL, stopDistL, estPxL, false)
+        plannedQty      := qL
+        rejectWhy       := whyL
+        if qL > 0
+            pendAtr := atr
+            pendDir := 1
+            strategy.entry("L", strategy.long, qty = qL, comment = "LONG " + str.tostring(riskPctL * 100, "#.##") + "%")
+            // 진입봉부터 보호되도록 신호봉 종가 기준 임시 손절을 함께 낸다.
+            strategy.exit("L-X", from_entry = "L", stop = close - stopDistL, comment = "LONG STOP")
+
+// ───────────────────────────────────────────────────────────────────────────
+// 8. 표시 · 알림
+// ───────────────────────────────────────────────────────────────────────────
+pUp  = plot(showBands ? bbUp  : na, "BB 상단", color.new(color.teal,   0))
+pMid = plot(showBands ? bbMid : na, "BB 중앙", color.new(color.gray,  40))
+pLo  = plot(showBands ? bbLo  : na, "BB 하단", color.new(color.teal,   0))
+fill(pUp, pLo, color = showBands ? color.new(color.teal, 92) : na)
+plot(showBands ? sma200 : na, "SMA200", color.new(color.orange, 0), linewidth = 2)
+
+bgcolor(showSqueeze and sqReady ? color.new(color.yellow, 88) : na, title = "squeeze ready")
+
+plot(showStop and inPos ? posCurStop : na, "현재 손절선", color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(showStop and inPos and posDir < 0 and not posPartial ? posTpPrice : na, "숏 2R 익절", color.new(color.green, 0), style = plot.style_linebr)
+plot(showStop and inPos and posDir < 0 ? posLowestLow : na, "최저저가", color.new(color.fuchsia, 60), style = plot.style_linebr)
+
+plotshape(shortSignal and enableShort, "숏 신호", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.tiny)
+plotshape(longBreakout,                "롱 breakout(setup)", shape.circle, location.belowbar, color.new(color.blue, 40), size = size.tiny)
+plotshape(longRetestSignal and enableLong, "롱 retest 진입신호", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.tiny)
+
+if wantShort and plannedQty == 0 and rejectWhy != ""
+    label.new(bar_index, low, "숏 거절: " + rejectWhy, style = label.style_label_up, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
+if wantLong and plannedQty == 0 and rejectWhy != ""
+    label.new(bar_index, high, "롱 거절: " + rejectWhy, style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
+
+alertcondition(shortSignal, "BBSQ 숏 신호", "BB Squeeze v15-A 숏 신호 (다음 4H 시가 진입)")
+alertcondition(longRetestSignal, "BBSQ 롱 신호", "BB Squeeze v15-A 롱 retest 신호 (다음 4H 시가 진입)")
+alertcondition(longBreakout, "BBSQ 롱 breakout setup", "BB Squeeze v15-A 롱 breakout setup 생성 (최대 3봉 내 retest 대기)")
+
+if barstate.islast
+    var table tb = table.new(position.top_right, 2, 9, border_width = 1)
+    table.cell(tb, 0, 0, "BBSQ v15-A r2",       bgcolor = color.new(color.blue, 60), text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 0, timeframe.period,      bgcolor = color.new(color.blue, 60), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 1, "BBW %ile",  text_size = size.tiny)
+    table.cell(tb, 1, 1, str.tostring(bbwRank, "#.###"), text_size = size.tiny)
+    table.cell(tb, 0, 2, "ATR% %ile", text_size = size.tiny)
+    table.cell(tb, 1, 2, str.tostring(atrRank, "#.###"), text_size = size.tiny)
+    table.cell(tb, 0, 3, "squeeze(직전5)", text_size = size.tiny)
+    table.cell(tb, 1, 3, str.tostring(sqCount, "#") + " / " + str.tostring(sqMinBars), text_size = size.tiny)
+    table.cell(tb, 0, 4, "BBW 증가율",  text_size = size.tiny)
+    table.cell(tb, 1, 4, str.tostring(bbwGrowth * 100, "#.##") + "%", text_size = size.tiny)
+    table.cell(tb, 0, 5, "SMA200 기울기", text_size = size.tiny)
+    table.cell(tb, 1, 5, str.tostring(smaSlope, format.mintick), text_size = size.tiny)
+    table.cell(tb, 0, 6, "BTC 국면",   text_size = size.tiny)
+    table.cell(tb, 1, 6, btcDataOk ? (btcClose >= btcSma ? "bullish → 숏 " + str.tostring(baseRisk * bullMult * 100, "#.##") + "%" : "bearish → 숏 " + str.tostring(baseRisk * 100, "#.##") + "%") : "데이터없음", text_size = size.tiny)
+    table.cell(tb, 0, 7, "롱 setup 잔여", text_size = size.tiny)
+    table.cell(tb, 1, 7, na(lsRef) ? "-" : str.tostring(lsRemaining) + "봉 @ " + str.tostring(lsRef, format.mintick), text_size = size.tiny)
+    table.cell(tb, 0, 8, "보유 봉수",   text_size = size.tiny)
+    table.cell(tb, 1, 8, inPos ? str.tostring(posBars) + " / " + str.tostring(posDir > 0 ? longMaxBars : shortMaxBars) : "-", text_size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  원본(Python 봇)과의 알려진 차이 — 백테스트 해석 시 반드시 감안할 것
+//
+//  1) 교차-심볼 포트폴리오 한도 미재현
+//     원 봇의 4% 공유 초기위험 / 5배 총명목 / 동시 6포지션은 계좌 전체 기준이다.
+//     이 스크립트는 심볼당 최대 1포지션이므로 4%·6포지션 한도는 사실상 무력하고,
+//     5배 명목 한도만 (단일 포지션 기준으로) 적용된다. 11개 심볼을 각각 돌려
+//     합산한 결과는 원 봇보다 위험이 과대평가된다.
+//
+//  2) 종가 규칙 청산의 체결 시점
+//     원 봇은 봉 마감 직후(약 20초) 시장가로 청산한다. Pine 기본 설정에서는
+//     다음 봉 시가에 체결된다. process_orders_on_close=true 로 바꾸면 청산은
+//     맞지만 진입까지 신호봉 종가로 당겨지므로 원본과 더 달라진다.
+//
+//  3) 숏 부분익절의 주문 유형
+//     원 봇은 take-profit '시장가 트리거'(슬리피지 1%)이고 여기서는 지정가다.
+//     지정가는 낙관적으로 체결될 수 있다.
+//
+//  4) 진입봉 보호
+//     실제 체결 평균가는 다음 봉 시가에야 알 수 있으므로, 진입봉 동안에는
+//     신호봉 종가 기준 임시 손절/익절이 걸리고 진입봉 종가에 실제 평균가 기준
+//     으로 갱신된다. 원 봇은 체결 확인 직후 실제 평균가로 설치한다.
+//
+//  5) 같은 봉 청산 후 재진입
+//     원 봇은 한 확정봉에서 청산이 끝나면 같은 봉의 신호로 재진입할 수 있다.
+//     Pine 에서는 청산 주문이 다음 봉 시가에 체결되므로 그 봉은 건너뛴다.
+//
+//  6) ATR 시드
+//     pandas ewm(adjust=False) 는 '첫 TR 값'을 시드로 쓴다. ta.rma 는 SMA 시드를
+//     쓰므로 값이 다르다. 그래서 여기서는 pandas 재귀식을 그대로 구현했다.
+//
+//  7) 펀딩비 미반영 / 수수료·슬리피지는 strategy() 설정값에 의존한다.
+//
+//  ⚠ 거래당 2% / BTC bullish 숏 1% 는 원 연구(1.25% / 0.625%) 위에 얹은
+//    미검증 운용 변경이다. 원본 README 의 경고를 그대로 옮긴다: 과거 -40~-45%
+//    MDD 를 2/1.25 배로 단순 환산해서는 안 되며, 실제 낙폭은 선형보다 더 악화될
+//    수 있다.
+// ═══════════════════════════════════════════════════════════════════════════
