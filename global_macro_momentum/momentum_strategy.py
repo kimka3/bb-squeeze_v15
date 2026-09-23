@@ -17,6 +17,11 @@ v2.1 (v2 자체 점검에서 나온 버그)
   [C2] 레버리지 손실 하한: 슬리브 가치가 음수가 되어 이후 손실이 이익으로 뒤집히던 문제 → 전액 손실(강제청산) 처리
   [C3] 원화 기준 손익: 해외 자산 손익에 환율(KRW=X 등) 변동 반영 (base_currency='KRW')
   [C4] 시간봉 라벨을 봉 종료 시각으로 이동: 봉 시작 시각에 그 봉의 종가를 쓰던 1시간 미래참조 제거
+
+v2.2 (장기 백테스트)
+  [D1] 일봉 시가·고가·저가로 스탑 주문 모사 (stop_mode='daily_ohlc' / 'auto')
+       → 시간봉 729일 한도와 무관하게 일봉이 있는 전 기간 백테스트
+  [D2] compare_stop_modes(): 시간봉 구간에서 방식별 결과 비교로 일봉 방식의 오차 확인
 """
 import yfinance as yf
 import pandas as pd
@@ -65,8 +70,24 @@ class MomentumStrategy:
                  financing_spread=0.02,
                  # [C3] 손익 기준 통화. 'KRW'면 해외 자산 손익에 환율 변동을 반영 (None이면 미반영, v1 동작)
                  #      신호·손절은 현지 통화 가격 그대로 (실제 브로커 스탑 주문과 동일한 기준)
-                 base_currency='KRW', currency_overrides=None):
+                 base_currency='KRW', currency_overrides=None,
+                 # [D1] 손절 판정 방식
+                 #   'auto'        : 시간봉 구간은 시간봉 종가, 그 이전은 일봉 시가·고가·저가 (기본)
+                 #   'hourly'      : 시간봉 종가, 그 이전은 일봉 종가 (v2.1 동작)
+                 #   'daily_ohlc'  : 전 구간 일봉 시가·고가·저가 — 장기 백테스트용
+                 #   'daily_close' : 전 구간 일봉 종가 (비교용)
+                 stop_mode='auto',
+                 # [D1] 일봉 안에서 고가·저가 순서 가정: 'high_first'(보수적) / 'low_first'
+                 ohlc_intraday_order='high_first'):
 
+        if stop_mode not in ('auto', 'hourly', 'daily_ohlc', 'daily_close'):
+            raise ValueError(f"stop_mode는 auto/hourly/daily_ohlc/daily_close 중 하나: {stop_mode!r}")
+        if ohlc_intraday_order not in ('high_first', 'low_first'):
+            raise ValueError(f"ohlc_intraday_order는 high_first/low_first 중 하나: {ohlc_intraday_order!r}")
+        self.stop_mode = stop_mode
+        self.ohlc_intraday_order = ohlc_intraday_order
+        self.daily_ohlc = None
+        self._ohlc_cache = {}
         self.tickers_dict = tickers_dict
         self.base_currency = base_currency
         self.currency_overrides = currency_overrides or {}
@@ -323,7 +344,8 @@ class MomentumStrategy:
 
         if h_start > start - timedelta(days=7):
             print(f"  ⚠ 1시간봉은 yfinance 한도(약 729일)로 {h_start:%Y-%m-%d} 이후만 제공됩니다.")
-            print(f"    → 그 이전 구간의 손절/트레일링은 확정된 일봉 종가 기준으로 체크합니다.")
+            basis = "일봉 시가·고가·저가" if self.stop_mode == 'auto' else "확정된 일봉 종가"
+            print(f"    → 그 이전 구간의 손절/트레일링은 {basis} 기준으로 체크합니다.")
 
         print(f"  1시간봉 다운로드 중... ({len(all_tickers)}개 티커, 병렬)")
         hourly = yf.download(all_tickers, start=h_start, end=end + timedelta(days=1),
@@ -340,6 +362,15 @@ class MomentumStrategy:
         self.raw_price_data = raw.sort_index()
         self.price_data = self.raw_price_data.ffill()
 
+        # [D1] 일봉 시가·고가·저가 (auto_adjust=True라 종가와 같은 기준으로 수정주가 반영)
+        self.daily_ohlc = {}
+        for fld in ('Open', 'High', 'Low'):
+            f = self._extract_field(daily, all_tickers, fld)
+            if not f.empty and f.index.tz is not None:
+                f.index = f.index.tz_localize(None)
+            self.daily_ohlc[fld] = f.sort_index()
+        self._ohlc_cache = {}
+
         hp = pd.DataFrame(all_hourly)
         if not hp.empty:
             hp.index = hp.index.tz_localize('UTC') if hp.index.tz is None else hp.index.tz_convert('UTC')
@@ -351,6 +382,18 @@ class MomentumStrategy:
 
         self._data_start, self._data_end, self._hourly_start = data_start, end, h_start
         print("✓ 데이터 다운로드 완료 (일봉 + 1시간봉, UTC)")
+
+    @staticmethod
+    def _extract_field(df, tickers, field):
+        """yfinance 결과에서 Open/High/Low 같은 필드를 티커별 DataFrame으로"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            if field not in df.columns.get_level_values(0):
+                return pd.DataFrame()
+            sub = df[field]
+            return pd.DataFrame({t: sub[t] for t in tickers if t in sub.columns})
+        return pd.DataFrame({tickers[0]: df[field]}) if field in df.columns else pd.DataFrame()
 
     @staticmethod
     def _extract_prices(df, tickers, out_dict):
@@ -403,11 +446,55 @@ class MomentumStrategy:
 
     # ──────────────────────── 손절매 / 재진입 ────────────────────────
 
+    def _register_stop(self, asset, bp, fill, ts, current_month, stop_type, hwm=None):
+        """손절 1건 기록 (시간봉·일봉 공통). 반환: 손절 기록 dict"""
+        ticker = asset['ticker']
+        ret = (fill - bp) / bp
+        si = {
+            'date': ts, 'asset': asset['name'], 'ticker': ticker,
+            'buy_price': bp, 'sell_price': fill, 'stop_price': fill,
+            'loss_pct': ret * 100, 'weight': asset['target_weight'],
+            'is_reentry_stop': 'reentry_price' in asset,
+            'leverage': asset['leverage'], 'month': current_month, 'stop_type': stop_type,
+        }
+        self.stop_loss_history.append(si)
+        self.stop_loss_timestamps[ticker] = ts
+        dt_str = ts.strftime('%Y-%m-%d %H:%M UTC')
+        if stop_type == 'trailing':
+            tp = self.get_asset_trailing_pct(asset['name'])
+            self.trailing_stop_history.append({
+                'type': 'trailing_stop', 'high_water_mark': hwm, 'trailing_pct': tp,
+                'stop_price': fill, 'buy_price': bp, 'return_pct': ret * 100,
+                'date': ts, 'asset': asset['name']})
+            print(f"    📉 Trailing Stop [{dt_str}]: {asset['name']} "
+                  f"(HWM {hwm:.2f}→{fill:.2f}, {ret*100:.2f}%)")
+        else:
+            tag = "🛑🔄 재진입후 손절" if 'reentry_price' in asset else "🛑 고정 손절"
+            print(f"    {tag} [{dt_str}]: {asset['name']} ({ret*100:.2f}%)")
+        return si
+
+    def _register_reentry(self, st, fill, ts, current_month, count):
+        """재진입 1건 기록 (시간봉·일봉 공통). 반환: (재진입 자산 dict, 재진입 기록 dict)"""
+        sa, orig = st['info'], st['asset']
+        ticker, sp = sa['ticker'], sa['stop_price']
+        self.reentry_count_tracker.setdefault(current_month, {})[ticker] = count + 1
+        ra = {**orig, 'reentry_price': fill, 'stop_price': sp, 'reentry_count': count + 1}
+        ev = {
+            'date': ts, 'asset': sa['asset'], 'ticker': ticker,
+            'stop_price': sp, 'reentry_price': fill,
+            'reentry_pct': ((fill - sp) / sp) * 100,
+            'leverage': orig['leverage'], 'weight': orig['target_weight'],
+            'reentry_count': count + 1, 'month': current_month,
+        }
+        self.reentry_history.append(ev)
+        print(f"    ✅ 재진입 [{ts:%Y-%m-%d %H:%M} UTC] ({count+1}/{self.max_reentry_count}): {sa['asset']}")
+        return ra, ev
+
     def check_stop_loss_and_reentry_hourly(self, holding, stopped, current_dt, current_month, price_row=None):
         """holding: 보유 자산 dict 리스트, stopped: [{'info': 손절기록, 'asset': 원 자산 dict}]
         반환: (holding, stopped, 이번 시각 손절 이벤트 리스트, 이번 시각 재진입 이벤트 리스트)
         [B7] 이벤트를 직접 반환 → 호출부가 이력 전체를 타임스탬프로 재탐색하지 않음.
-        각 자산은 자신의 [entry_ts, exit_ts) 구간 안에서만 감시."""
+        각 자산은 자신의 [entry_ts, exit_ts) 구간 안에서만 감시. 판정·체결은 해당 시각의 종가."""
         current_dt = self._to_utc(current_dt)
 
         def _px(ticker):
@@ -439,26 +526,11 @@ class MomentumStrategy:
             ret = (cp - bp) / bp
             ts_hit, ts_info = self._check_trailing_stop(asset, bp, cp)
             if ts_hit or ret <= self.stop_loss_pct:
-                stop_type = 'trailing' if ts_hit else 'fixed'
-                si = {
-                    'date': current_dt, 'asset': asset['name'], 'ticker': ticker,
-                    'buy_price': bp, 'sell_price': cp, 'stop_price': cp,
-                    'loss_pct': ret * 100, 'weight': asset['target_weight'],
-                    'is_reentry_stop': 'reentry_price' in asset,
-                    'leverage': asset['leverage'], 'month': current_month, 'stop_type': stop_type,
-                }
-                self.stop_loss_history.append(si)
+                si = self._register_stop(asset, bp, cp, current_dt, current_month,
+                                         'trailing' if ts_hit else 'fixed',
+                                         ts_info['high_water_mark'] if ts_hit else None)
                 stop_events.append(si)
                 new_stopped.append({'info': si, 'asset': asset})
-                self.stop_loss_timestamps[ticker] = current_dt
-                dt_str = current_dt.strftime('%Y-%m-%d %H:%M UTC')
-                if ts_hit:
-                    self.trailing_stop_history.append({**ts_info, 'date': current_dt, 'asset': asset['name']})
-                    print(f"    📉 Trailing Stop [{dt_str}]: {asset['name']} "
-                          f"(HWM {ts_info['high_water_mark']:.2f}→{cp:.2f}, {ts_info['return_pct']:.2f}%)")
-                else:
-                    tag = "🛑🔄 재진입후 손절" if 'reentry_price' in asset else "🛑 고정 손절"
-                    print(f"    {tag} [{dt_str}]: {asset['name']} ({ret*100:.2f}%)")
             else:
                 remaining.append(asset)
 
@@ -478,20 +550,120 @@ class MomentumStrategy:
             count = counts.get(ticker, 0)
             can_time, _ = self._can_reenter_time(ticker, current_dt)
             if cp >= sp * (1 + self.reentry_threshold_pct) and count < self.max_reentry_count and can_time:
-                counts[ticker] = count + 1
-                ra = {**orig, 'reentry_price': cp, 'stop_price': sp, 'reentry_count': count + 1}
+                ra, ev = self._register_reentry(st, cp, current_dt, current_month, count)
                 remaining.append(ra)
                 self.high_water_marks[ticker] = cp
-                ev = {
-                    'date': current_dt, 'asset': sa['asset'], 'ticker': ticker,
-                    'stop_price': sp, 'reentry_price': cp,
-                    'reentry_pct': ((cp - sp) / sp) * 100,
-                    'leverage': orig['leverage'], 'weight': orig['target_weight'],
-                    'reentry_count': count + 1, 'month': current_month,
-                }
-                self.reentry_history.append(ev)
                 reentry_events.append(ev)
-                print(f"    ✅ 재진입 [{current_dt:%Y-%m-%d %H:%M} UTC] ({count+1}/{self.max_reentry_count}): {sa['asset']}")
+            else:
+                remaining_stopped.append(st)
+
+        return remaining, remaining_stopped, stop_events, reentry_events
+
+    # ──────────────────────── 일봉 OHLC 손절 (스탑 주문 모사) ────────────────────────
+
+    def _ohlc_bar(self, ticker, day):
+        """[D1] 날짜 day의 (시가, 고가, 저가, 종가). 실제 거래일이 아니면 None.
+        고가·저가가 없거나 시가·종가와 모순되면 시가·종가로 보정."""
+        cache = self._ohlc_cache.get(ticker)
+        if cache is None:
+            cache = {}
+            if self.raw_price_data is not None and ticker in self.raw_price_data:
+                c = self.raw_price_data[ticker]
+                cols = {'c': c}
+                for key, fld in (('o', 'Open'), ('h', 'High'), ('l', 'Low')):
+                    df = (self.daily_ohlc or {}).get(fld)
+                    cols[key] = df[ticker].reindex(c.index) if df is not None and ticker in df else c
+                f = pd.DataFrame(cols).dropna(subset=['c'])
+                for key in ('o', 'h', 'l'):
+                    f[key] = f[key].fillna(f['c'])
+                hi = f[['o', 'h', 'l', 'c']].max(axis=1)
+                lo = f[['o', 'h', 'l', 'c']].min(axis=1)
+                cache = {d: (float(o), float(h), float(l), float(cl))
+                         for d, o, h, l, cl in zip(f.index, f['o'], hi, lo, f['c'])}
+            self._ohlc_cache[ticker] = cache
+        return cache.get(day)
+
+    def _stop_level(self, asset, bp, hwm):
+        """현재 걸려 있을 스탑 가격. 트레일링 가격이 매수가보다 높으면 트레일링, 아니면 고정 손절.
+        (시간봉 판정과 같은 규칙: 트레일링은 수익 구간에서만 동작)"""
+        if self.enable_trailing_stop:
+            trail = hwm * (1 - self.get_asset_trailing_pct(asset['name']))
+            if trail > bp:
+                return trail, 'trailing'
+        return bp * (1 + self.stop_loss_pct), 'fixed'
+
+    def _ohlc_stop(self, asset, bp, bar):
+        """[D1] 하루치 OHLC로 스탑 주문 체결 여부 판정. 반환 (체결가 or None, 종류, 갱신된 HWM)
+        1) 시가가 이미 스탑가 이하(갭 하락) → 시가 체결
+        2) 장중 순서 가정 (ohlc_intraday_order)
+           high_first: 고가를 먼저 찍고 저가 → HWM을 고가로 올린 뒤 저가로 판정 (트레일링에 보수적)
+           low_first : 저가를 먼저 → 전날 HWM 기준 저가 판정, 이후 고가로 HWM 갱신, 종가로 한 번 더 판정
+        장중 체결은 스탑가 그대로 (슬리피지는 transaction_cost로 반영)"""
+        o, h, l, c = bar
+        hwm = self.high_water_marks.get(asset['ticker'], bp)
+        lvl, kind = self._stop_level(asset, bp, hwm)
+        if o <= lvl:
+            return o, kind, hwm
+        if self.ohlc_intraday_order == 'high_first':
+            hwm = max(hwm, h)
+            lvl, kind = self._stop_level(asset, bp, hwm)
+            if l <= lvl:
+                return lvl, kind, hwm
+        else:
+            if l <= lvl:
+                return lvl, kind, hwm
+            hwm = max(hwm, h)
+            lvl, kind = self._stop_level(asset, bp, hwm)
+            if c <= lvl:
+                return lvl, kind, hwm
+        return None, None, hwm
+
+    def check_stop_loss_and_reentry_daily(self, holding, stopped, day, ts, current_month):
+        """[D1] 일봉 OHLC 기준 손절/재진입. ts = day 종가가 확정된 시각(day+1 00:00 UTC).
+        각 자산은 (entry_ts, exit_ts] 구간의 거래일을 감시 — 청산일 장중 손절도 포함.
+        재진입은 '재진입가 이상 매수 스탑'으로 모사: 고가가 재진입가 이상이면 max(재진입가, 시가)에 체결.
+        같은 날 손절→재진입은 하지 않음 (쿨다운이 36시간 미만이어도 보수적으로 막음)."""
+        def _active(a):
+            return a['entry_ts'] < ts <= a['exit_ts']
+
+        stop_events, reentry_events = [], []
+        remaining, new_stopped = [], list(stopped)
+
+        for asset in holding:
+            bar = self._ohlc_bar(asset['ticker'], day) if _active(asset) else None
+            if bar is None:
+                remaining.append(asset)
+                continue
+            bp = asset.get('reentry_price') or asset['entry_price']
+            fill, kind, hwm = self._ohlc_stop(asset, bp, bar)
+            self.high_water_marks[asset['ticker']] = hwm
+            if fill is None:
+                remaining.append(asset)
+                continue
+            si = self._register_stop(asset, bp, fill, ts, current_month, kind, hwm)
+            stop_events.append(si)
+            new_stopped.append({'info': si, 'asset': asset, 'day': day})
+
+        remaining_stopped = []
+        counts = self.reentry_count_tracker.setdefault(current_month, {})
+        for st in new_stopped:
+            sa, orig = st['info'], st['asset']
+            bar = None
+            if _active(orig) and st.get('day') != day:
+                bar = self._ohlc_bar(sa['ticker'], day)
+            if bar is None:
+                remaining_stopped.append(st)
+                continue
+            o, h, l, c = bar
+            threshold = sa['stop_price'] * (1 + self.reentry_threshold_pct)
+            count = counts.get(sa['ticker'], 0)
+            can_time, _ = self._can_reenter_time(sa['ticker'], ts)
+            if h >= threshold and count < self.max_reentry_count and can_time:
+                fill = max(threshold, o)
+                ra, ev = self._register_reentry(st, fill, ts, current_month, count)
+                self.high_water_marks[sa['ticker']] = max(fill, c)
+                remaining.append(ra)
+                reentry_events.append(ev)
             else:
                 remaining_stopped.append(st)
 
@@ -506,29 +678,30 @@ class MomentumStrategy:
     # ──────────────────────── 감시 타임라인 ────────────────────────
 
     def _build_timeline(self, start_ts, end_ts):
-        """[B1][B2] (start_ts, end_ts) 사이의 감시 시각 목록 [(ts, price_row or None)].
-        시간봉이 있는 구간은 시간봉, 시간봉 이전 구간은 '확정 일봉 종가'(D+1 00:00 UTC) 시각으로 채움.
-        v1은 시간봉이 월 중간부터 시작하면 그 앞부분을 통째로 감시하지 않았음."""
-        events = []
-        h_first = end_ts
-        if self.hourly_price_data is not None and not self.hourly_price_data.empty:
+        """[B1][B2] (start_ts, end_ts] 사이의 감시 이벤트 목록 [(종류, ts, 데이터)].
+          ('h', ts, price_row): 시간봉 (ts = 봉 종가 확정 시각)
+          ('d', ts, day)      : 일봉 (ts = day 종가 확정 시각 = day+1 00:00 UTC)
+        stop_mode가 'daily_ohlc'/'daily_close'면 시간봉을 쓰지 않고 전 구간 일봉.
+        그 외에는 시간봉이 있는 구간은 시간봉, 시간봉 이전 구간은 일봉으로 채움."""
+        hourly_events = []
+        h_first = None
+        use_hourly = self.stop_mode in ('auto', 'hourly')
+        if use_hourly and self.hourly_price_data is not None and not self.hourly_price_data.empty:
             hp = self.hourly_price_data
             hp = hp.loc[(hp.index >= start_ts) & (hp.index < end_ts)]
             if len(hp):
                 h_first = hp.index[0]
                 arr = hp.to_numpy(dtype=float)
                 cidx = {c: j for j, c in enumerate(hp.columns)}
-                hourly_events = [(ts, (arr[i], cidx)) for i, ts in enumerate(hp.index)]
-            else:
-                hourly_events = []
-        else:
-            hourly_events = []
+                hourly_events = [('h', ts, (arr[i], cidx)) for i, ts in enumerate(hp.index)]
 
-        for d in self.price_data.index:
-            ts = self._next_day_utc(d)
-            if start_ts < ts < h_first and ts <= end_ts:
-                events.append((ts, None))
-        return events + hourly_events
+        idx = self.price_data.index
+        known = idx + pd.Timedelta(days=1)
+        mask = (known > start_ts.tz_localize(None)) & (known <= end_ts.tz_localize(None))
+        if h_first is not None:
+            mask &= known < h_first.tz_localize(None)
+        daily_events = [('d', k.tz_localize('UTC'), d) for d, k in zip(idx[mask], known[mask])]
+        return daily_events + hourly_events
 
     # ──────────────────────── 월별 수익률 계산 ────────────────────────
 
@@ -586,15 +759,21 @@ class MomentumStrategy:
             start_ts = min(a['entry_ts'] for a in holding)
             end_ts = max(a['exit_ts'] for a in holding)
             timeline = self._build_timeline(start_ts, end_ts)
-            if not any(pr is not None for _, pr in timeline):
-                print(f"  ⚠ {current_month}: 시간봉 없음 → 확정 일봉 종가 기준으로 손절/트레일링 체크")
+            daily_ohlc = self.stop_mode in ('auto', 'daily_ohlc')
+            if self.stop_mode in ('auto', 'hourly') and not any(k == 'h' for k, _, _ in timeline):
+                basis = "일봉 시가·고가·저가" if daily_ohlc else "확정 일봉 종가"
+                print(f"  ⚠ {current_month}: 시간봉 없음 → {basis} 기준으로 손절/트레일링 체크")
 
             stopped = []
-            for ts, price_row in timeline:
+            for kind, ts, payload in timeline:
                 if not holding and not stopped:
                     break
-                holding, stopped, stops, reentries = self.check_stop_loss_and_reentry_hourly(
-                    holding, stopped, ts, current_month, price_row=price_row)
+                if kind == 'd' and daily_ohlc:
+                    holding, stopped, stops, reentries = self.check_stop_loss_and_reentry_daily(
+                        holding, stopped, payload, ts, current_month)
+                else:
+                    holding, stopped, stops, reentries = self.check_stop_loss_and_reentry_hourly(
+                        holding, stopped, ts, current_month, price_row=payload if kind == 'h' else None)
                 for sl in stops:
                     _record(sl['ticker'], 'sell', ts, sl['sell_price'], sl['leverage'], sl['weight'], sl['stop_type'])
                 for r in reentries:
@@ -909,8 +1088,9 @@ class MomentumStrategy:
 
     # ──────────────────────── 백테스트 ────────────────────────
 
-    def run_backtest(self, start_date, end_date):
+    def run_backtest(self, start_date, end_date, plot=True):
         print(f"\n{'='*60}\n백테스트 ({start_date} ~ {end_date})\n{'='*60}")
+        print(f"  손절 판정: {self.stop_mode} (일봉 장중 순서 가정: {self.ohlc_intraday_order})")
         print(f"  체결: {'신호 다음 거래일 종가' if self.execute_next_session else '신호일 종가(낙관적)'} | "
               f"조달비용: {'미반영' if self.financing_spread is None else f'기준금리+{self.financing_spread*100:.1f}%p'}")
         self._prepare_data(start_date, end_date)
@@ -953,26 +1133,33 @@ class MomentumStrategy:
             self.selected_assets_history.append({'date': sell, 'assets': [a['name'] for a in selected] or ['Cash']})
 
         self._print_current_holdings(dates[-2], dates[-1])
-        self._print_final_results()
+        self._print_final_results(plot=plot)
 
-    def _print_final_results(self):
-        if not self.monthly_returns:
-            return
+    def _performance(self):
+        """마지막 백테스트의 성과 요약 dict (단위: %)"""
         df = pd.DataFrame(self.monthly_returns)
-        df['cumulative_return'] = df['portfolio_value'] / self.initial_capital - 1
-
-        fv = df['portfolio_value'].iloc[-1]
-        tr = df['cumulative_return'].iloc[-1]
-        n = len(df)
+        tr = df['portfolio_value'].iloc[-1] / self.initial_capital - 1
         # [R3] 마지막 구간이 부분월이어도 실제 경과일로 연환산
         years = (pd.Timestamp(df['date'].iloc[-1]) - pd.Timestamp(self._bt_start)).days / 365.25
         cagr = ((1 + tr) ** (1 / years) - 1) * 100 if years > 0 else 0
         excess = df['return'] - df['bok_rate'] / 100 / 12
         std = df['return'].std()
         sharpe = (excess.mean() / std) * np.sqrt(12) if std > 0 else 0
-        df['dd'] = 1 - df['portfolio_value'] / df['portfolio_value'].cummax()
-        mdd = max(df['dd'].max(), 1 - df['portfolio_value'].min() / self.initial_capital)
-        wr = (df['return'] > 0).sum() / n * 100
+        dd = 1 - df['portfolio_value'] / df['portfolio_value'].cummax()
+        mdd = max(dd.max(), 1 - df['portfolio_value'].min() / self.initial_capital)
+        return {'total_return': tr * 100, 'cagr': cagr, 'years': years, 'mdd': mdd * 100,
+                'sharpe': sharpe, 'win_rate': (df['return'] > 0).mean() * 100, 'months': len(df),
+                'final_value': df['portfolio_value'].iloc[-1],
+                'stops': len(self.stop_loss_history), 'reentries': len(self.reentry_history),
+                'trailing': len(self.trailing_stop_history)}
+
+    def _print_final_results(self, plot=True):
+        if not self.monthly_returns:
+            return
+        df = pd.DataFrame(self.monthly_returns)
+        perf = self._performance()
+        fv, tr, n, years = perf['final_value'], perf['total_return'] / 100, perf['months'], perf['years']
+        cagr, sharpe, mdd, wr = perf['cagr'], perf['sharpe'], perf['mdd'] / 100, perf['win_rate']
 
         print(f"\n{'='*60}\n최종 결과\n{'='*60}")
         print(f"총 수익률: {tr*100:+.2f}% | CAGR: {cagr:+.2f}% ({years:.2f}년)")
@@ -986,7 +1173,67 @@ class MomentumStrategy:
             print(f"⚠ 표본 {n}개월: 통계적으로 전략 우위를 판단하기에 짧습니다 (REVIEW.md 참고).")
 
         self._print_monthly_stats(df)
-        self._plot_results(df)
+        if plot:
+            self._plot_results(df)
+
+    # ──────────────────────── 손절 판정 방식 검증 ────────────────────────
+
+    _RESULT_ATTRS = ('monthly_returns', 'selected_assets_history', 'stop_loss_history', 'reentry_history',
+                     'trailing_stop_history', 'monthly_leverage_history', 'transaction_history',
+                     'current_holdings_detail', 'total_transaction_costs', 'total_financing_costs',
+                     'total_transaction_volume', '_bt_start', 'is_risk_on', 'high_water_marks',
+                     'reentry_count_tracker', 'stop_loss_timestamps', 'stop_mode', 'ohlc_intraday_order')
+
+    def compare_stop_modes(self, start_date=None, end_date=None):
+        """[D2] 시간봉이 있는 기간에서 손절 판정 방식별 결과를 비교해 일봉 OHLC 방식의 오차를 확인.
+        기준은 'hourly'(시간봉 종가). 일봉 OHLC 결과가 기준과 가까우면, 시간봉이 없는 과거 구간에도
+        일봉 OHLC 방식(stop_mode='daily_ohlc')으로 장기 백테스트를 돌릴 근거가 됩니다.
+        백테스트를 4번 더 돌리며, 끝나면 기존 백테스트 결과·설정을 그대로 되돌려 놓습니다."""
+        import contextlib
+        import io
+        end_date = end_date or datetime.now().strftime('%Y-%m-%d')
+        if start_date is None:
+            h0 = pd.Timestamp(self._hourly_start or (datetime.now() - timedelta(days=729)))
+            start_date = (h0.normalize() + pd.offsets.MonthEnd(1)).strftime('%Y-%m-%d')
+        print(f"\n{'='*72}\n🔬 손절 판정 방식 비교 ({start_date} ~ {end_date}, 기준 = 시간봉)\n{'='*72}")
+
+        saved = {k: getattr(self, k) for k in self._RESULT_ATTRS}
+        cases = [('시간봉 종가 (기준)', 'hourly', 'high_first'),
+                 ('일봉 OHLC · 고가 먼저', 'daily_ohlc', 'high_first'),
+                 ('일봉 OHLC · 저가 먼저', 'daily_ohlc', 'low_first'),
+                 ('일봉 종가만', 'daily_close', 'high_first')]
+        rows, monthly = [], {}
+        try:
+            for label, mode, order in cases:
+                self.stop_mode, self.ohlc_intraday_order = mode, order
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.run_backtest(start_date, end_date, plot=False)
+                if not self.monthly_returns:
+                    print("  백테스트 결과 없음 (기간이 너무 짧음)")
+                    return None
+                perf = self._performance()
+                monthly[label] = pd.Series([m['return'] for m in self.monthly_returns],
+                                           index=[m['date'] for m in self.monthly_returns]) * 100
+                rows.append({'방식': label, **perf})
+        finally:
+            for k, v in saved.items():
+                setattr(self, k, v)
+
+        base = monthly[cases[0][0]]
+        out = pd.DataFrame(rows).set_index('방식')
+        out['월수익률 평균오차(%p)'] = [(monthly[l] - base).abs().mean() for l in out.index]
+        out['월수익률 상관'] = [monthly[l].corr(base) for l in out.index]
+        cols = ['total_return', 'cagr', 'mdd', 'sharpe', 'stops', 'trailing', 'reentries',
+                '월수익률 평균오차(%p)', '월수익률 상관']
+        out = out[cols].rename(columns={'total_return': '총수익률%', 'cagr': 'CAGR%', 'mdd': 'MDD%',
+                                        'sharpe': '샤프', 'stops': '손절', 'trailing': '트레일링',
+                                        'reentries': '재진입'})
+        with pd.option_context('display.float_format', '{:,.2f}'.format, 'display.width', 200):
+            print(out.to_string())
+        print("\n  읽는 법: 일봉 OHLC 행의 '월수익률 평균오차'가 작고 '상관'이 1에 가까울수록 시간봉을 잘 근사합니다.")
+        print("  두 순서 가정(고가 먼저/저가 먼저)의 결과 폭이 일봉 방식의 불확실성 범위입니다.")
+        print("  비교는 시간봉 구간(약 2년)에서만 한 것이라, 장기 구간에서의 오차는 이 범위와 다를 수 있습니다.")
+        return out
 
     def _print_monthly_stats(self, df):
         df['date'] = pd.to_datetime(df['date'])
@@ -1117,6 +1364,7 @@ class MomentumStrategy:
             tp = self.trailing_pct_map
             print(f"--- Trailing Stop: 가상화폐 {tp['crypto']*100:.1f}%, 채권 {tp['bond']*100:.1f}%, "
                   f"원자재 {tp['commodity']*100:.1f}%, 기본 {tp['default']*100:.1f}% ---")
+        print(f"--- 손절 판정: {self.stop_mode} (일봉 장중 순서: {self.ohlc_intraday_order}) ---")
         print(f"--- 거래비용: {self.transaction_cost*100:.2f}% | 1시간봉 UTC | "
               f"손익 통화: {self.base_currency or '현지 통화(환율 미반영)'} ---")
 
@@ -1137,7 +1385,15 @@ if __name__ == "__main__":
         "은": "SI=F", "TRX/USD": "TRX-USD", "코스닥150": "229200.KS",
     }
 
+    # ── 백테스트 기간과 손절 판정 방식 ──
+    # 최근 2년(시간봉 구간):  BACKTEST_START = "2024-07-31", STOP_MODE = 'auto'
+    # 장기(예: 2018년~):      BACKTEST_START = "2018-12-31", STOP_MODE = 'daily_ohlc'
+    #   → 장기에서는 기간 전체를 같은 방식으로 판정해야 앞뒤 구간을 공정하게 비교할 수 있습니다.
+    #   → 상장이 늦은 종목(국내 해외지수 ETF 다수, SOL 등)은 데이터가 생긴 뒤부터 후보가 됩니다.
     BACKTEST_START = "2024-07-31"
+    STOP_MODE = 'auto'
+    RUN_STOP_MODE_CHECK = True   # 시간봉 구간에서 방식별 비교 (백테스트 4회 추가 실행)
+
     strategy = MomentumStrategy(
         tickers_dict=tickers, initial_capital=200000000,
         momentum_threshold_min=1.2, momentum_threshold_max=3.0,
@@ -1156,6 +1412,7 @@ if __name__ == "__main__":
         bond_trailing_pct=0.03, commodity_trailing_pct=0.03,
         # v1 가정으로 되돌리려면 execute_next_session=False, financing_spread=None, base_currency=None
         execute_next_session=True, financing_spread=0.02, base_currency='KRW',
+        stop_mode=STOP_MODE, ohlc_intraday_order='high_first',
     )
 
     # [B5] history_start = 백테스트 시작일 → 다운로드 1회
@@ -1166,3 +1423,6 @@ if __name__ == "__main__":
         pv_now = strategy.monthly_returns[-1]['portfolio_value'] if strategy.monthly_returns else strategy.initial_capital
         print("\n목표 포지션표 (주문 전송 안 함):")
         print(strategy.build_order_sheet(current_portfolio, pv_now).to_string(index=False))
+
+    if RUN_STOP_MODE_CHECK:
+        strategy.compare_stop_modes()

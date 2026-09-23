@@ -53,31 +53,33 @@ def make_hourly(tickers, start, end, drift=None, vol=0.004, seed=0, shocks=None)
 
 
 def daily_from_hourly(hourly):
-    """일봉 날짜 D = 해당 UTC 날짜의 마지막 시간봉 종가 (크립토 UTC 일봉과 동일한 정의)"""
-    out = {}
+    """일봉 날짜 D = 해당 UTC 날짜의 시간봉으로 만든 OHLC (크립토 UTC 일봉과 동일한 정의)
+    반환: {필드: {티커: Series}}"""
+    out = {f: {} for f in ("Open", "High", "Low", "Close")}
     for t, s in hourly.items():
-        d = s.groupby(s.index.tz_convert(None).normalize()).last()
-        out[t] = d
+        g = s.groupby(s.index.tz_convert(None).normalize())
+        out["Open"][t], out["High"][t], out["Low"][t], out["Close"][t] = g.first(), g.max(), g.min(), g.last()
     return out
 
 
 def fake_download_factory(hourly, hourly_available_from):
     daily = daily_from_hourly(hourly)
 
-    def _frame(series_map, tickers):
-        df = pd.DataFrame({t: series_map[t] for t in tickers if t in series_map})
-        df.columns = pd.MultiIndex.from_product([["Close"], df.columns])
-        return df
+    def _frame(fields, tickers):
+        parts = {}
+        for f, series_map in fields.items():
+            parts[f] = pd.DataFrame({t: series_map[t] for t in tickers if t in series_map})
+        return pd.concat(parts, axis=1)
 
     def fake_download(tickers, start=None, end=None, interval="1d", **kw):
         if interval == "1h":
             lo = max(pd.Timestamp(start), pd.Timestamp(hourly_available_from)).tz_localize("UTC")
             hi = pd.Timestamp(end).tz_localize("UTC")
             sm = {t: s[(s.index >= lo) & (s.index < hi)] for t, s in hourly.items()}
-            return _frame(sm, tickers)
+            return _frame({"Close": sm}, tickers)
         lo, hi = pd.Timestamp(start), pd.Timestamp(end)
-        sm = {t: s[(s.index >= lo) & (s.index < hi)] for t, s in daily.items()}
-        return _frame(sm, tickers)
+        fields = {f: {t: s[(s.index >= lo) & (s.index < hi)] for t, s in m.items()} for f, m in daily.items()}
+        return _frame(fields, tickers)
 
     return fake_download
 
@@ -215,6 +217,67 @@ class TestLeverageFixedAtSelection(unittest.TestCase, PrepMixin):
         self.assertAlmostEqual(sheet["notional_krw"].iloc[0], 1e8 * 0.5 * 2.0)
 
 
+class TestDailyOHLCStops(unittest.TestCase, PrepMixin):
+    """[D1] 시간봉이 없는 구간(=2년보다 오래된 과거)의 일봉 OHLC 손절"""
+
+    def _month(self, shocks, **kw):
+        tick = {"BTC/USD": "BTC-USD"}
+        hourly = make_hourly(list(tick.values()) + FILTERS, "2023-01-01", "2024-03-05", vol=0.0, shocks=shocks)
+        s = build(tick, hourly, "2030-01-01", execute_next_session=False, financing_spread=None, **kw)
+        self.prepare(s, "2024-01-31", "2024-03-04")
+        self.assertTrue(s.hourly_price_data.empty)      # 시간봉 없음
+        s.is_risk_on = True
+        sel = [{"name": "BTC/USD", "ticker": "BTC-USD", "momentum_score": 1.3, "target_weight": 0.5}]
+        run_quiet(s.calculate_monthly_return, sel, "2024-01-31", "2024-02-29", 1e8)
+        return s
+
+    DIP = {"BTC-USD": [("2024-02-10 05:00", 0.95), ("2024-02-10 08:00", 1 / 0.95)]}
+
+    def test_intraday_dip_hits_stop_order(self):
+        # 장중 -5% 후 종가 회복: 스탑 주문(-3%)은 체결됐어야 함. 일봉 종가 방식은 놓침.
+        s = self._month(self.DIP, stop_mode="auto")
+        self.assertEqual(len(s.stop_loss_history), 1)
+        sl = s.stop_loss_history[0]
+        self.assertAlmostEqual(sl["sell_price"], 97.0)                  # 스탑가 체결
+        self.assertEqual(sl["date"], pd.Timestamp("2024-02-11", tz="UTC"))  # 2/10 일봉 확정 시각
+        for mode in ("hourly", "daily_close"):
+            self.assertEqual(len(self._month(self.DIP, stop_mode=mode).stop_loss_history), 0, mode)
+
+    def test_exit_day_intraday_is_monitored(self):
+        dip = {"BTC-USD": [("2024-02-29 05:00", 0.95), ("2024-02-29 08:00", 1 / 0.95)]}
+        s = self._month(dip, stop_mode="daily_ohlc")
+        self.assertEqual([x["date"] for x in s.stop_loss_history], [pd.Timestamp("2024-03-01", tz="UTC")])
+
+    def test_gap_down_fills_at_open(self):
+        s = self._month({"BTC-USD": [("2024-02-10 00:00", 0.9)]}, stop_mode="daily_ohlc")
+        self.assertAlmostEqual(s.stop_loss_history[0]["sell_price"], 90.0)
+
+    def test_intraday_order_assumption(self):
+        # 100 → 110(고가) → 105 → 108(종가): 고가 뒤 트레일링(110×0.97=106.7) 아래로 내려갔음.
+        shocks = {"BTC-USD": [("2024-02-10 01:00", 1.10), ("2024-02-10 06:00", 105 / 110),
+                              ("2024-02-10 20:00", 108 / 105)]}
+        hi = self._month(shocks, stop_mode="daily_ohlc", ohlc_intraday_order="high_first")
+        self.assertEqual(len(hi.stop_loss_history), 1)
+        self.assertEqual(hi.stop_loss_history[0]["stop_type"], "trailing")
+        self.assertAlmostEqual(hi.stop_loss_history[0]["sell_price"], 110 * 0.97)
+        lo = self._month(shocks, stop_mode="daily_ohlc", ohlc_intraday_order="low_first")
+        self.assertEqual(len(lo.stop_loss_history), 0)   # 저가(100)가 먼저라고 가정하면 미체결
+
+    def test_reentry_uses_high(self):
+        # 2/10 손절(97) → 2/15 장중 100까지 회복: 재진입가 97×1.01에 매수 스탑 체결
+        shocks = {"BTC-USD": [("2024-02-10 05:00", 0.95), ("2024-02-15 03:00", 100 / 95)]}
+        s = self._month(shocks, stop_mode="daily_ohlc")
+        self.assertEqual(len(s.reentry_history), 1)
+        r = s.reentry_history[0]
+        self.assertAlmostEqual(r["reentry_price"], 97 * 1.01)
+        self.assertEqual(r["date"], pd.Timestamp("2024-02-16", tz="UTC"))
+        self.assertEqual(len(s.stop_loss_history), 1)
+
+    def test_invalid_mode_rejected(self):
+        with redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
+            ms.MomentumStrategy({}, stop_mode="minute")
+
+
 class TestPartialHourlyCoverage(unittest.TestCase, PrepMixin):
     def test_gap_before_hourly_start_is_monitored_with_daily(self):
         # [B2] 시간봉이 2/20부터만 있는 달. 2/5 급락은 일봉으로 감시돼야 함 (v1은 감시 안 함).
@@ -276,6 +339,16 @@ class TestEndToEnd(unittest.TestCase, PrepMixin):
             per_month = pd.Series([r["month"] + r["ticker"] for r in s.reentry_history]).value_counts()
             self.assertTrue((per_month <= s.max_reentry_count).all() if len(per_month) else True)
             self.assertLessEqual(len(s.reentry_history), len(s.stop_loss_history))
+
+        # [D2] 방식 비교: 4개 방식 결과를 내고, 끝나면 원래 결과·설정이 그대로 복원돼야 함
+        before = [m["portfolio_value"] for m in s.monthly_returns]
+        with mock.patch.object(ms.yf, "download", side_effect=s._fake):
+            out, _ = run_quiet(s.compare_stop_modes, "2024-06-30", "2024-12-30")
+        self.assertEqual(len(out), 4)
+        self.assertAlmostEqual(out["월수익률 상관"].iloc[0], 1.0)
+        self.assertAlmostEqual(out["월수익률 평균오차(%p)"].iloc[0], 0.0)
+        self.assertEqual([m["portfolio_value"] for m in s.monthly_returns], before)
+        self.assertEqual(s.stop_mode, "auto")
 
 
 if __name__ == "__main__":
