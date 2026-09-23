@@ -11,6 +11,12 @@ v2 변경 요약 (자세한 근거는 같은 폴더의 REVIEW.md)
   [R1] 체결 시점 옵션 execute_next_session: 신호일 다음 거래일 종가 체결 (실전과 같은 타이밍)
   [R2] 레버리지 조달비용 반영: 차입분 × (기준금리 + financing_spread)
   [R3] 성과지표: 실제 기간 기준 CAGR, 무위험수익률 차감 샤프
+
+v2.1 (v2 자체 점검에서 나온 버그)
+  [C1] 레버리지를 선정 시점에 고정: 주문표·요약이 '마지막으로 분석한 날짜'의 위험 ON/OFF를 따라가던 문제
+  [C2] 레버리지 손실 하한: 슬리브 가치가 음수가 되어 이후 손실이 이익으로 뒤집히던 문제 → 전액 손실(강제청산) 처리
+  [C3] 원화 기준 손익: 해외 자산 손익에 환율(KRW=X 등) 변동 반영 (base_currency='KRW')
+  [C4] 시간봉 라벨을 봉 종료 시각으로 이동: 봉 시작 시각에 그 봉의 종가를 쓰던 1시간 미래참조 제거
 """
 import yfinance as yf
 import pandas as pd
@@ -56,9 +62,15 @@ class MomentumStrategy:
                  # [R1] True: 신호일(월말) 다음 거래일 종가에 체결 / False: 신호일 종가에 즉시 체결(v1 동작)
                  execute_next_session=True,
                  # [R2] 레버리지 차입분 연 조달금리 = 기준금리 + spread (None이면 조달비용 미반영, v1 동작)
-                 financing_spread=0.02):
+                 financing_spread=0.02,
+                 # [C3] 손익 기준 통화. 'KRW'면 해외 자산 손익에 환율 변동을 반영 (None이면 미반영, v1 동작)
+                 #      신호·손절은 현지 통화 가격 그대로 (실제 브로커 스탑 주문과 동일한 기준)
+                 base_currency='KRW', currency_overrides=None):
 
         self.tickers_dict = tickers_dict
+        self.base_currency = base_currency
+        self.currency_overrides = currency_overrides or {}
+        self._fx_warned = set()
         self.initial_capital = initial_capital
         self.momentum_threshold_min = momentum_threshold_min
         self.momentum_threshold_max = momentum_threshold_max
@@ -160,6 +172,42 @@ class MomentumStrategy:
         if ticker and ticker in self.MAX_LEVERAGE_CAP:
             lev = min(lev, self.MAX_LEVERAGE_CAP[ticker])
         return lev
+
+    # ──────────────────────── 통화 / 환율 ────────────────────────
+
+    FX_TICKERS = {'USD': 'KRW=X', 'GBP': 'GBPKRW=X', 'JPY': 'JPYKRW=X'}
+
+    def _currency_of(self, ticker):
+        """티커의 호가 통화 추정. 다르면 currency_overrides={'티커': '통화'}로 지정."""
+        if ticker in self.currency_overrides:
+            return self.currency_overrides[ticker]
+        if ticker.endswith(('.KS', '.KQ')):
+            return 'KRW'
+        if ticker == '^FTSE' or ticker.endswith('.L'):
+            return 'GBP'
+        if ticker == '^N225' or ticker.endswith('.T'):
+            return 'JPY'
+        return 'USD'
+
+    def _fx_tickers_needed(self):
+        if not self.base_currency:
+            return []
+        curs = {self._currency_of(t) for t in self.tickers_dict.values()}
+        return sorted(self.FX_TICKERS[c] for c in curs
+                      if c != self.base_currency and c in self.FX_TICKERS)
+
+    def _fx_at(self, currency, ts):
+        """ts 시점에 확정된 (기준통화 / 현지통화) 환율. 비교 불가하면 1.0 (경고 1회)."""
+        if not self.base_currency or currency == self.base_currency:
+            return 1.0
+        fx_t = self.FX_TICKERS.get(currency)
+        rate = self._daily_close_known_at(fx_t, ts) if fx_t else None
+        if rate is None or rate <= 0:
+            if currency not in self._fx_warned:
+                print(f"  ⚠ {currency}→{self.base_currency} 환율 데이터 없음 → 해당 통화 환율 변동 미반영")
+                self._fx_warned.add(currency)
+            return 1.0
+        return rate
 
     def get_bok_rate(self, date_str):
         key = str(date_str)[:7]
@@ -267,10 +315,11 @@ class MomentumStrategy:
                 all_tickers.append(t)
 
         all_data, all_hourly = {}, {}
-        print(f"  일봉 다운로드 중... ({len(all_tickers)}개 티커, 병렬)")
-        daily = yf.download(all_tickers, start=data_start, end=end + timedelta(days=1),
+        daily_tickers = all_tickers + [t for t in self._fx_tickers_needed() if t not in all_tickers]
+        print(f"  일봉 다운로드 중... ({len(daily_tickers)}개 티커, 병렬)")
+        daily = yf.download(daily_tickers, start=data_start, end=end + timedelta(days=1),
                             progress=False, threads=True, auto_adjust=True)
-        self._extract_prices(daily, all_tickers, all_data)
+        self._extract_prices(daily, daily_tickers, all_data)
 
         if h_start > start - timedelta(days=7):
             print(f"  ⚠ 1시간봉은 yfinance 한도(약 729일)로 {h_start:%Y-%m-%d} 이후만 제공됩니다.")
@@ -281,7 +330,7 @@ class MomentumStrategy:
                              interval='1h', progress=False, threads=True, auto_adjust=True)
         self._extract_prices(hourly, all_tickers, all_hourly)
 
-        missing = [t for t in all_tickers if t not in all_data]
+        missing = [t for t in daily_tickers if t not in all_data]
         if missing:
             print(f"  ⚠ 일봉 누락 티커: {missing}")
 
@@ -294,6 +343,9 @@ class MomentumStrategy:
         hp = pd.DataFrame(all_hourly)
         if not hp.empty:
             hp.index = hp.index.tz_localize('UTC') if hp.index.tz is None else hp.index.tz_convert('UTC')
+            # [C4] Yahoo 시간봉 라벨은 '봉 시작 시각'인데 값은 그 봉의 종가 → 최대 1시간 미래참조.
+            #      라벨을 +1시간 옮겨 '가격이 확정된 시각'으로 통일 (일봉의 D+1 00:00 규칙과 같은 의미)
+            hp.index = hp.index + pd.Timedelta(hours=1)
             hp = hp.sort_index().ffill()
         self.hourly_price_data = hp
 
@@ -505,11 +557,15 @@ class MomentumStrategy:
             if not ep or not xp:
                 print(f"  ⚠ {a['name']}: 진입/청산 가격 없음 → 해당 비중 현금 처리")
                 continue
-            a = {**a,
-                 'leverage': self.get_leverage_for_momentum(a.get('momentum_score', 0), ticker=a['ticker']),
+            # [C1] 레버리지는 선정 시점에 확정된 값 사용 (전역 is_risk_on 상태에 의존하지 않음)
+            lev = a.get('leverage')
+            if lev is None:
+                lev = self.get_leverage_for_momentum(a.get('momentum_score', 0), ticker=a['ticker'])
+            a = {**a, 'leverage': lev,
                  'entry_price': ep, 'entry_ts': ets, 'exit_price': xp, 'exit_ts': xts}
             holding.append(a)
             self.high_water_marks[a['ticker']] = ep
+        windows = {a['ticker']: (a['entry_ts'], a['exit_ts']) for a in holding}
 
         txns = {a['ticker']: [] for a in holding}
         monthly_cost = 0.0
@@ -557,6 +613,7 @@ class MomentumStrategy:
             cum_val = pv * w
             hold_h = 0.0
             open_buy = None
+            liquidated = False
             for tx in tx_list:
                 if tx['type'] == 'buy':
                     open_buy = tx
@@ -569,13 +626,27 @@ class MomentumStrategy:
                         fin = fin_annual * (lev - 1) * hours / HOURS_PER_YEAR
                         lev_ret -= fin
                         self.total_financing_costs += cum_val * fin
-                    cum_val *= (1 + lev_ret)
                     hold_h += max(hours, 0)
                     open_buy = None
+                    # [C2] 레버리지 손실은 증거금(슬리브 가치)까지만. v1/v2는 음수가 되어
+                    #      이후 음수×손실이 이익으로 뒤집혔음. 실제로는 그 전에 강제청산됨.
+                    if lev_ret <= -1:
+                        print(f"  ☠ {self._ticker_to_name(ticker)}: 레버리지 {lev}x 손실 {lev_ret*100:.1f}% "
+                              f"→ 슬리브 전액 손실(강제청산)로 처리")
+                        cum_val, liquidated = 0.0, True
+                        break
+                    cum_val *= (1 + lev_ret)
 
             cash_h = period_h - hold_h
-            if cash_h > 0:
+            if cash_h > 0 and not liquidated:
                 cum_val *= (1 + (rate / 100) * cash_h / HOURS_PER_YEAR)
+
+            # [C3] 원화 환산: 슬리브는 진입~월말 청산까지 현지 통화로 유지된다고 가정
+            #      (레버리지 차입분은 같은 통화라 환노출은 자기자본 1배분)
+            ets, xts = windows[ticker]
+            cur = self._currency_of(ticker)
+            fx_ret = self._fx_at(cur, xts) / self._fx_at(cur, ets) - 1
+            cum_val *= (1 + fx_ret)
 
             if record_detail:
                 buys = [t for t in tx_list if t['type'] == 'buy']
@@ -591,6 +662,7 @@ class MomentumStrategy:
                     'current_price': self.get_latest_price(ticker),
                     'weight': w, 'leverage': buys[0]['leverage'] if buys else None,
                     'position_return': cum_val / (pv * w) - 1,
+                    'currency': cur, 'fx_return': fx_ret,
                     'status': status, 'reentry_count': n_reentry,
                 })
             total_final += cum_val
@@ -653,9 +725,11 @@ class MomentumStrategy:
 
         print(f"\n선택 자산 ({len(final)}개):")
         for i, a in enumerate(final, 1):
-            lev = self.get_leverage_for_momentum(a['momentum_score'], a['ticker'])
+            # [C1] 선정 시점(위험 ON)의 레버리지를 자산에 고정. 이후 다른 날짜를 분석해 is_risk_on이
+            #      바뀌어도 이 포트폴리오의 레버리지는 변하지 않음
+            a['leverage'] = self.get_leverage_for_momentum(a['momentum_score'], a['ticker'])
             tp = self.get_asset_trailing_pct(a['name'])
-            print(f"  {i}. {a['name']}: {a['momentum_score']:.3f} (비중 {a['target_weight']*100:.1f}%, {lev}x, TS {tp*100:.1f}%)")
+            print(f"  {i}. {a['name']}: {a['momentum_score']:.3f} (비중 {a['target_weight']*100:.1f}%, {a['leverage']}x, TS {tp*100:.1f}%)")
         if not final:
             print(f"  → 현금 투자 (기준금리: {self.get_bok_rate(date_str)}%)")
         return final
@@ -760,6 +834,9 @@ class MomentumStrategy:
             return None
 
         signal_day = self._last_completed_month_end()
+        if signal_day is None:
+            print("직전 월말 데이터 없음")
+            return None
         print(f"\n[1] 지금 보유해야 할 포트폴리오 — 직전 월말 신호 ({signal_day})")
         selected = self.analyze_monthly_momentum(signal_day)
         self._print_portfolio_summary(selected, signal_day)
@@ -776,21 +853,29 @@ class MomentumStrategy:
             print(f"❌ 투자 대상 없음 → 현금 (기준금리: {self.get_bok_rate(date_str)}%)")
             return
         for a in selected:
-            lev = self.get_leverage_for_momentum(a['momentum_score'], a['ticker'])
             tp = self.get_asset_trailing_pct(a['name'])
-            print(f"  {a['name']}: 비중 {a['target_weight']*100:.1f}%, 점수 {a['momentum_score']:.3f}, {lev}x, TS {tp*100:.1f}%")
+            print(f"  {a['name']}: 비중 {a['target_weight']*100:.1f}%, 점수 {a['momentum_score']:.3f}, "
+                  f"{a['leverage']}x, TS {tp*100:.1f}%")
 
     def build_order_sheet(self, selected, portfolio_value):
         """실전 주문 준비용 목표 포지션표 (주문 전송은 하지 않음).
-        명목금액 = 자본 × 비중 × 레버리지. 가격은 원통화 기준이며 환산은 별도로 해야 함."""
+        명목금액(원) = 자본 × 비중 × 레버리지, 수량 = 명목금액 / (현지가 × 환율).
+        국내 주식·ETF는 정수 주로 내림. 그 외 최소 주문 단위는 브로커·거래소마다 달라 반영하지 않음."""
         rows = []
+        now = pd.Timestamp.now(tz='UTC')
         for a in selected:
-            lev = self.get_leverage_for_momentum(a['momentum_score'], a['ticker'])
+            lev = a['leverage']
             ref = self.get_latest_price(a['ticker'])
+            cur = self._currency_of(a['ticker'])
+            fx = self._fx_at(cur, now)
+            notional = portfolio_value * a['target_weight'] * lev
+            qty = notional / (ref * fx) if ref else None
+            if qty is not None and cur == 'KRW':
+                qty = float(np.floor(qty))
             rows.append({
-                'name': a['name'], 'ticker': a['ticker'], 'weight': a['target_weight'], 'leverage': lev,
-                'notional_krw': portfolio_value * a['target_weight'] * lev,
-                'ref_price': ref,
+                'name': a['name'], 'ticker': a['ticker'], 'currency': cur,
+                'weight': a['target_weight'], 'leverage': lev,
+                'notional_krw': notional, 'ref_price': ref, 'fx_rate': fx, 'quantity': qty,
                 'fixed_stop_price': ref * (1 + self.stop_loss_pct) if ref else None,
                 'trailing_pct': self.get_asset_trailing_pct(a['name']),
             })
@@ -810,15 +895,16 @@ class MomentumStrategy:
             if h['entry_price'] and h['current_price']:
                 raw = f" (원자산 {(h['current_price'] / h['entry_price'] - 1) * 100:+.2f}%)"
             lev = f"{h['leverage']:.1f}x" if h['leverage'] else "-"
+            fx = f" 환율 {h['fx_return']*100:+.2f}%" if h['currency'] != 'KRW' and h['fx_return'] else ""
             print(f"  • {h['name']:<12} 진입 {ep:>13} → 현재 {cp:>13} | "
                   f"비중 {h['weight']*100:4.1f}% | {lev} | "
-                  f"포지션수익률 {h['position_return']*100:+6.2f}%{raw} | {h['status']}")
+                  f"포지션수익률 {h['position_return']*100:+6.2f}%{raw}{fx} | {h['status']}")
         weighted = sum(h['position_return'] * h['weight'] for h in self.current_holdings_detail)
         invested_w = sum(h['weight'] for h in self.current_holdings_detail)
         print(f"  {'-'*68}")
         print(f"  투자 비중 합계: {invested_w*100:.1f}% | 현금 비중: {(1-invested_w)*100:.1f}%")
         print(f"  포지션 가중합 수익률(미배정 현금 이자 제외): {weighted*100:+.2f}%")
-        print(f"  ※ 포지션수익률 = 레버리지·거래비용·조달비용·손절/재진입 반영")
+        print(f"  ※ 포지션수익률 = 레버리지·거래비용·조달비용·손절/재진입·환율({self.base_currency or '미반영'}) 반영")
         print(f"  ※ 원자산% = 진입가 대비 현재가 단순 변동(레버리지·비용 미반영)")
 
     # ──────────────────────── 백테스트 ────────────────────────
@@ -1031,7 +1117,8 @@ class MomentumStrategy:
             tp = self.trailing_pct_map
             print(f"--- Trailing Stop: 가상화폐 {tp['crypto']*100:.1f}%, 채권 {tp['bond']*100:.1f}%, "
                   f"원자재 {tp['commodity']*100:.1f}%, 기본 {tp['default']*100:.1f}% ---")
-        print(f"--- 거래비용: {self.transaction_cost*100:.2f}% | 1시간봉 UTC ---")
+        print(f"--- 거래비용: {self.transaction_cost*100:.2f}% | 1시간봉 UTC | "
+              f"손익 통화: {self.base_currency or '현지 통화(환율 미반영)'} ---")
 
 
 # ──────────────────────── 실행 ────────────────────────
@@ -1067,8 +1154,8 @@ if __name__ == "__main__":
         enable_trailing_stop=True,
         default_trailing_pct=0.03, crypto_trailing_pct=0.03,
         bond_trailing_pct=0.03, commodity_trailing_pct=0.03,
-        # v1 결과와 직접 비교하려면 execute_next_session=False, financing_spread=None
-        execute_next_session=True, financing_spread=0.02,
+        # v1 가정으로 되돌리려면 execute_next_session=False, financing_spread=None, base_currency=None
+        execute_next_session=True, financing_spread=0.02, base_currency='KRW',
     )
 
     # [B5] history_start = 백테스트 시작일 → 다운로드 1회

@@ -92,7 +92,7 @@ def build(tickers_dict, hourly, hourly_from, **kw):
                   stop_loss_pct=-0.03, reentry_threshold_pct=0.01, max_reentry_count=2,
                   reentry_cooldown_hours=36, default_trailing_pct=0.03, crypto_trailing_pct=0.03,
                   bond_trailing_pct=0.03, commodity_trailing_pct=0.03,
-                  macro_filter_sma_months=10, bond_filter_sma_months=10)
+                  macro_filter_sma_months=10, bond_filter_sma_months=10, base_currency=None)
     params.update(kw)
     with redirect_stdout(io.StringIO()):
         s = ms.MomentumStrategy(**params)
@@ -140,10 +140,21 @@ class TestMonitoringWindow(unittest.TestCase, PrepMixin):
 
     def test_last_day_is_monitored(self):
         # [B1] 청산일(2/29) 당일 급락은 감시되어야 함. v1은 2/29 00:00에서 감시를 끝냈음.
+        # [C4] 12:00에 시작한 봉의 종가는 13:00에 확정 → 손절 시각은 13:00
         shocks = {"BTC-USD": [("2024-02-29 12:00", 0.9)]}
         s, _ = self._single_month(shocks, execute_next_session=False, financing_spread=None)
         self.assertEqual(len(s.stop_loss_history), 1)
-        self.assertEqual(s.stop_loss_history[0]["date"], pd.Timestamp("2024-02-29 12:00", tz="UTC"))
+        self.assertEqual(s.stop_loss_history[0]["date"], pd.Timestamp("2024-02-29 13:00", tz="UTC"))
+
+    def test_leveraged_loss_is_floored_at_zero(self):
+        # [C2] 2배에서 한 봉 -70% → 슬리브 -140%. v2까지는 음수 가치가 남아 월 수익률 약 -90%.
+        #      증거금 이상 잃을 수 없으므로 슬리브 0 → 가상화폐 50% + 현금 50%에서 약 -50%.
+        shocks = {"BTC-USD": [("2024-02-10 12:00", 0.3)]}
+        s, ret = self._single_month(shocks, execute_next_session=False, financing_spread=None,
+                                    leverage_multiplier_1=2.0)
+        self.assertEqual(len(s.stop_loss_history), 1)
+        self.assertGreater(ret, -0.5)
+        self.assertLess(ret, -0.49)
 
     def test_flat_price_return_is_cost_plus_cash(self):
         s, ret = self._single_month({}, execute_next_session=False, financing_spread=None)
@@ -158,6 +169,50 @@ class TestMonitoringWindow(unittest.TestCase, PrepMixin):
         _, r_no = self._single_month({}, financing_spread=None, **kw)
         _, r_fin = self._single_month({}, financing_spread=0.02, **kw)
         self.assertLess(r_fin, r_no)
+
+
+class TestCurrency(unittest.TestCase, PrepMixin):
+    def test_usd_asset_return_includes_fx(self):
+        # [C3] 가격은 그대로, 원/달러만 +10% → 원화 기준 달러 자산 슬리브 +10%
+        tick = {"BTC/USD": "BTC-USD"}
+        hourly = make_hourly(list(tick.values()) + FILTERS + ["KRW=X"], "2023-01-01", "2024-03-05",
+                             vol=0.0, shocks={"KRW=X": [("2024-02-15 15:30", 1.1)]})
+        s = build(tick, hourly, "2022-01-01", execute_next_session=False, financing_spread=None,
+                  base_currency="KRW")
+        self.prepare(s, "2024-01-31", "2024-03-04")
+        s.is_risk_on = True
+        sel = [{"name": "BTC/USD", "ticker": "BTC-USD", "momentum_score": 1.3, "target_weight": 0.5}]
+        ret, _ = run_quiet(s.calculate_monthly_return, sel, "2024-01-31", "2024-02-29", 1e8,
+                           record_detail=True)
+        rate = s.get_bok_rate("2024-02-29") / 100
+        pos = (1 - 0.001) / (1 + 0.001)
+        cash = 1 + rate * 29 * 24 / ms.HOURS_PER_YEAR
+        self.assertAlmostEqual(ret, 0.5 * pos * 1.1 + 0.5 * cash - 1, places=10)
+        self.assertAlmostEqual(s.current_holdings_detail[0]["fx_return"], 0.1, places=10)
+
+    def test_currency_mapping(self):
+        with redirect_stdout(io.StringIO()):
+            s = ms.MomentumStrategy({"a": "069500.KS", "b": "^FTSE", "c": "TLT", "d": "BTC-USD"})
+        self.assertEqual([s._currency_of(t) for t in ["069500.KS", "^FTSE", "TLT", "BTC-USD"]],
+                         ["KRW", "GBP", "USD", "USD"])
+        self.assertEqual(s._fx_tickers_needed(), ["GBPKRW=X", "KRW=X"])
+
+
+class TestLeverageFixedAtSelection(unittest.TestCase, PrepMixin):
+    def test_order_sheet_leverage_ignores_later_risk_state(self):
+        # [C1] 월말(위험 ON)에 2배로 선정된 포트폴리오는, 이후 다른 날짜 분석으로 위험 OFF가 되어도 2배
+        tick = {"BTC/USD": "BTC-USD"}
+        drift = {"BTC-USD": 4.3e-5, "^GSPC": 3e-4, "SHY": 1e-5}
+        hourly = make_hourly(list(tick.values()) + FILTERS, "2022-06-01", "2024-03-05", drift=drift, vol=0.0)
+        s = build(tick, hourly, "2022-01-01", leverage_multiplier_1=2.0)
+        self.prepare(s, "2024-01-31", "2024-03-04")
+        sel, _ = run_quiet(s.analyze_monthly_momentum, "2024-02-29")
+        self.assertEqual([a["name"] for a in sel], ["BTC/USD"])
+        self.assertTrue(1.2 <= sel[0]["momentum_score"] < 1.5)
+        s.is_risk_on = False            # 예: 오늘 미리보기 분석이 위험 OFF
+        sheet = s.build_order_sheet(sel, 1e8)
+        self.assertEqual(sheet["leverage"].iloc[0], 2.0)
+        self.assertAlmostEqual(sheet["notional_krw"].iloc[0], 1e8 * 0.5 * 2.0)
 
 
 class TestPartialHourlyCoverage(unittest.TestCase, PrepMixin):
@@ -202,14 +257,15 @@ class TestSelection(unittest.TestCase):
 class TestEndToEnd(unittest.TestCase, PrepMixin):
     def test_full_backtest_runs(self):
         tick = {"S&P 500": "449180.KS", "KOSPI 200": "069500.KS", "미국 20년 국채 ETF": "TLT",
-                "원유": "CL=F", "BTC/USD": "BTC-USD", "ETH/USD": "ETH-USD", "SOL/USD": "SOL-USD"}
-        tickers = list(tick.values()) + FILTERS
+                "원유": "CL=F", "BTC/USD": "BTC-USD", "ETH/USD": "ETH-USD", "SOL/USD": "SOL-USD",
+                "FTSE 100": "^FTSE"}
+        tickers = list(tick.values()) + FILTERS + ["KRW=X"]   # GBPKRW=X는 일부러 없음 → 경고 후 1.0
         drift = {t: 0.00008 for t in tickers}
         drift["SHY"] = 0.00001
         hourly = make_hourly(tickers, "2022-06-01", "2024-12-31", drift=drift, vol=0.004, seed=7)
         for nxt in (False, True):
             s = build(tick, hourly, "2024-06-01", execute_next_session=nxt, financing_spread=0.02,
-                      leverage_multiplier_1=2.0)
+                      leverage_multiplier_1=2.0, base_currency="KRW")
             self.prepare(s, "2023-08-31", "2024-12-30")
             with mock.patch.object(ms.plt, "show"):
                 run_quiet(s.run_backtest, "2023-08-31", "2024-12-30")
