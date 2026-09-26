@@ -2,3 +2,9 @@ __pycache__/
 *.py[cod]
 data/prepared.pkl
 live_state/
+.venv/
+.pytest_cache/
+paper_runs/
+work/
+*.local.json
+paper.config.json
