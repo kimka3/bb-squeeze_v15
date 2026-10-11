@@ -10,8 +10,8 @@ can collect maker opportunities without assuming any maker fill.
 Funding is a timestamped, idempotent ledger. Missing rates/settlement indexes are
 reported as unresolved; latest rates are never replayed over missed hours. A
 near-boundary public index is an explicitly labelled estimate, not settlement
-evidence. The official Funding schema leaves rate/value/direction semantics
-undocumented: raw directional rows are retained, never silently signed or paid.
+evidence. Direction and percent units follow the verified official funding UI;
+raw rows and lookup failures are retained (see docs/funding-repair.md).
 Operational tolerances are model settings, not measured guarantees.
 """
 from __future__ import annotations
@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .book import Quote, fetch_depth, walk
 from .broker import AccountState, Fill, OrderRef
+from .funding import funding_path, parse_funding, funding_amount
 
 
 @dataclass
@@ -199,7 +200,7 @@ class PaperBroker:
                 'breakeven_on_fill': self.breakeven_on_fill,
                 'funding_rate_is_percent': self.funding_rate_is_percent,
                 'funding_price_source': 'public_index_price',
-                'funding_direction_policy': 'unresolved_until_semantics_verified',
+                'funding_direction_policy': 'payer_direction_percent_v1',
                 'funding_mark_max_age_seconds': self.funding_mark_max_age_seconds}
 
     def _event(self, kind: str, **data) -> None:
@@ -594,8 +595,13 @@ class PaperBroker:
                     'next_retry': 0})
         self._last_funding_hour = max(self._last_funding_hour, hour)
         requests = 0
-        for event in self._funding_events.values():
-            if event['status'] not in ('pending_rate', 'missing_rate') or event['next_retry'] > now:
+        # Earliest retry first: a permanently missing oldest row must not starve
+        # every later settlement under the one-request protection budget.
+        events = sorted(self._funding_events.values(), key=lambda e:
+                        (e.get('next_retry', 0), e['settlement_hour'], e['symbol']))
+        for event in events:
+            if event['status'] not in ('pending_rate', 'missing_rate', 'lookup_error',
+                    'invalid_response', 'unverified_api_semantics') or event.get('next_retry', 0) > now:
                 continue
             # Proposed operational budget: never let a settlement backlog make
             # this fast protection poll issue an unbounded series of requests.
@@ -605,14 +611,14 @@ class PaperBroker:
             symbol = event['symbol']
             rate = self._funding_rate_at(self.markets[symbol].market_id, event['settlement_hour'])
             sample = self._funding_samples.get(f'{self.markets[symbol].market_id}:{event["settlement_hour"]}')
+            if sample:
+                event['raw_funding'] = sample
             if rate is None:
-                event['status'] = 'unverified_api_semantics' if sample else 'missing_rate'
-                if sample:
-                    event['raw_funding'] = sample
+                event['status'] = sample.get('status', 'missing_rate') if sample else 'missing_rate'
                 event['next_retry'] = now + 60
                 continue
             fraction = rate / 100 if self.funding_rate_is_percent else rate
-            amount = -event['qty'] * event['reference_price'] * fraction * (1 if event['side'] == 'LONG' else -1)
+            amount = funding_amount(event, fraction)
             self.cash += amount
             self.funding_total += amount
             p = self.book.get(symbol)
@@ -623,26 +629,19 @@ class PaperBroker:
             event.update(status='booked_estimate', rate=rate, amount=amount, next_retry=0)
 
     def _funding_rate_at(self, market_id: int, settlement_hour: int) -> float | None:
-        boundary = settlement_hour * 3600
+        path = funding_path(market_id, settlement_hour)
+        sample = {'observed_at_ms': _now_ms(), 'request_path': path}
         try:
-            data = self._get(f'/api/v1/fundings?market_id={market_id}&resolution=1h'
-                f'&start_timestamp={boundary - 3600}&end_timestamp={boundary}&count_back=2')
-            for row in data.get('fundings', []):
-                ts = float(row.get('timestamp', row.get('time', float('nan'))))
-                if ts > 1e12:
-                    ts /= 1000
-                rate = float(row.get('rate', float('nan')))
-                # Matching convention is explicit; never guess that rows[-1]
-                # represents this settlement. API semantics remain to reconcile.
-                if ts == boundary and math.isfinite(rate):
-                    if row.get('direction') is not None:
-                        self._funding_samples[f'{market_id}:{settlement_hour}'] = {
-                            'observed_at_ms': _now_ms(), 'raw': dict(row),
-                            'reason': 'official schema does not specify rate/value/direction sign and units'}
-                        return None
-                    return rate
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
+            data = self._get(path)
+            sample['response'] = data
+            sample.update(parse_funding(data, settlement_hour))
+        except OSError as exc:
+            sample.update(status='lookup_error', reason=str(exc))
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            sample.update(status='invalid_response', reason=str(exc))
+        self._funding_samples[f'{market_id}:{settlement_hour}'] = sample
+        if sample['status'] == 'resolved_rate':
+            return sample['signed_rate_percent'] if self.funding_rate_is_percent else sample['fraction']
         return None
 
     def _observe_risk(self) -> None:
@@ -691,7 +690,7 @@ class PaperBroker:
             'equity_excludes_unresolved_funding': bool(incomplete) or legacy_gap,
             'funding_unresolved': incomplete,
             'funding_events': list(self._funding_events.values()),
-            'funding_evidence': 'UNRESOLVED directional API rows; synthetic signed-rate estimates use public index, never mark fallback',
+            'funding_evidence': 'SIMULATED: verified payer-direction hourly percent rate times near-boundary public index; unresolved rows remain explicit',
             'raw_funding_samples': self._funding_samples,
             'observations': {'event_counts': self._event_counts, 'recent_events': self._events,
                 'mark_age_ms': {s: _now_ms() - ts for s, ts in self._mark_sample_ms.items()}},

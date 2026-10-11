@@ -312,11 +312,11 @@ def test_funding_must_match_timestamp_not_just_latest_row(tmp_path):
     # This synthetic old timestamp is below the epoch-ms heuristic, so test a
     # current-era timestamp for the actual ms contract separately.
     boundary = 1_800_000_000 // 3600 * 3600
-    b._get = lambda path: {'fundings': [{'timestamp': boundary * 1000, 'rate': .02}]}
+    b._get = lambda path: {'fundings': [{'timestamp': boundary * 1000, 'rate': .02, 'direction': 'long'}]}
     assert b._funding_rate_at(1, boundary // 3600) == .02
 
 
-def test_directional_api_funding_is_unresolved_and_raw_sample_preserved(tmp_path):
+def test_directional_api_funding_is_signed_and_raw_sample_preserved(tmp_path):
     b = funding_broker(tmp_path)
     now = 101 * 3600 + 1
     raw = {'timestamp': 101 * 3600, 'value': '0.01', 'rate': '0.01', 'direction': 'short'}
@@ -324,11 +324,11 @@ def test_directional_api_funding_is_unresolved_and_raw_sample_preserved(tmp_path
     b._get = lambda path: {'fundings': [raw]}
     with patch('live.paper.time.time', return_value=now):
         b._accrue_funding(b._marks)
-    assert b.funding_total == 0.
+    assert b.funding_total == pytest.approx(.1)
     report = b.measurements()
-    assert not report['performance_complete']
-    assert report['equity_excludes_unresolved_funding']
-    assert b._funding_events['ETHUSDT:101']['status'] == 'unverified_api_semantics'
+    assert report['performance_complete']
+    assert not report['equity_excludes_unresolved_funding']
+    assert b._funding_events['ETHUSDT:101']['status'] == 'booked_estimate'
     assert b._funding_events['ETHUSDT:101']['raw_funding']['raw'] == raw
 
 
