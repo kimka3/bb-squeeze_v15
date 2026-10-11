@@ -7,6 +7,7 @@ stop opening risk and get a human, not to improvise.
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import dataclass, field
 
 from data_io import H4
@@ -42,6 +43,10 @@ def check_bar_freshness(bar_ms: int, config, now_ms: int | None = None) -> Verdi
 def check_margin(state, config) -> Verdict:
     """Cross margin is shared across the book, and the backtest models none of it."""
     v = Verdict()
+    if (not math.isfinite(state.equity) or state.equity <= 0
+            or not math.isfinite(state.maintenance_margin) or state.maintenance_margin < 0):
+        v.add('invalid equity or maintenance margin; entries halted', halt=True)
+        return v
     ratio = state.margin_ratio
     if ratio < config.margin_ratio_alert:
         v.add(f'margin ratio {ratio:.2f} below alert level {config.margin_ratio_alert}', halt=True)
@@ -93,6 +98,8 @@ def reconcile(internal_positions: dict, state, symbol_to_lighter: dict) -> Verdi
         strat_symbol = reverse.get(lighter_symbol)
         if strat_symbol:
             exchange[strat_symbol] = pos
+        else:
+            v.add(f'{lighter_symbol}: unknown exchange position', halt=True)
 
     for symbol, p in internal_positions.items():
         live = exchange.get(symbol)
@@ -100,7 +107,8 @@ def reconcile(internal_positions: dict, state, symbol_to_lighter: dict) -> Verdi
             v.add(f'{symbol}: tracked internally but flat on Lighter', halt=True)
         elif live['side'] != p['side']:
             v.add(f'{symbol}: side {p["side"]} internally, {live["side"]} on Lighter', halt=True)
-        elif p['qty'] > 0 and abs(live['qty'] - p['qty']) / p['qty'] > .01:
+        elif not math.isclose(float(live['qty']), float(p['qty']),
+                              rel_tol=1e-9, abs_tol=1e-12):
             v.add(f'{symbol}: qty {p["qty"]:.6f} internally, {live["qty"]:.6f} on Lighter',
                   halt=True)
     for symbol in exchange:

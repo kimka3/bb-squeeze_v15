@@ -64,9 +64,11 @@ class ReplayBroker:
 
     def account_state(self) -> AccountState:
         positions = {SYMBOL_TO_LIGHTER[s]: {'side': p['side'], 'qty': p['qty'],
-                                            'entry': p['entry']}
+                                            'entry': p['entry'],
+                                            'partial_taken': p['partial_taken']}
                      for s, p in self.book.items() if p['qty'] > 1e-12}
-        return AccountState(equity=self.equity(), maintenance_margin=0.0, positions=positions)
+        return AccountState(equity=self.equity(), maintenance_margin=0.0, positions=positions,
+                            execution_changes_verified=True)
 
     def equity(self, prices: dict | None = None) -> float:
         if not prices:

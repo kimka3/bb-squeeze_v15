@@ -5,9 +5,9 @@ VERIFIED against the installed lighter-sdk (1.0.0) and the live public API on
 modify_order/cancel_order signatures, the c_uint32 price field, and the REST
 shapes for orderBooks, orderBookDetails, account and accountActiveOrders.
 
-NOT VERIFIED — no account was available to place a real order. Everything in
-LighterBroker past the signature level is written to the documented contract and
-must be confirmed on a funded test sub-account before `mode: live` is used.
+NOT VERIFIED — no account was available to place a real order. Live writes are
+disabled before submission until authenticated terminal execution confirmation
+and recovery are implemented and tested. A transaction receipt is not a fill.
 The two specific things to watch on first contact:
 
   1. create_sl_order submits ORDER_TYPE_STOP_LOSS with time_in_force=IOC. Once
@@ -44,6 +44,9 @@ class OrderRef:
     client_order_index: int
     order_index: int | None = None
     purpose: str = ''
+    trigger: float | None = None
+    qty: float | None = None
+    position_side: str = ''
 
 
 @dataclass
@@ -52,6 +55,10 @@ class AccountState:
     maintenance_margin: float
     positions: dict[str, dict] = field(default_factory=dict)   # symbol -> {side, qty, entry}
     active_orders: dict[str, list] = field(default_factory=dict)
+    # Only a reconciled execution ledger can attribute quantity changes to TP.
+    # A position endpoint by itself is insufficient evidence.
+    execution_changes_verified: bool = False
+    active_orders_verified: bool = False
 
     @property
     def margin_ratio(self) -> float:
@@ -107,7 +114,12 @@ class DryRunBroker:
         self.log.append({'op': 'market', 'symbol': symbol, 'side': position_side,
                          'qty': filled, 'price': ref_price, 'closing': closing, 'coi': coi})
         if closing:
-            self.positions.pop(market.symbol, None)
+            p = self.positions.get(market.symbol)
+            filled = min(filled, p['qty']) if p else 0.0
+            if p:
+                p['qty'] -= filled
+                if p['qty'] <= 1e-12:
+                    self.positions.pop(market.symbol, None)
         else:
             self.positions[market.symbol] = {'side': position_side, 'qty': filled,
                                              'entry': ref_price}
@@ -173,6 +185,17 @@ class LighterBroker:
             raise RuntimeError(f'{what} rejected by Lighter: {err}')
         return tx, resp
 
+    @staticmethod
+    def _require_verified_execution() -> None:
+        """Refuse BEFORE submission until authenticated fill recovery exists.
+
+        A transaction acknowledgement is not a terminal order result. Enabling
+        live requires a separately tested execution/order-status adapter; there
+        is deliberately no runtime override for this incomplete implementation.
+        """
+        raise RuntimeError('live execution disabled: authenticated terminal fill '
+                           'confirmation and recovery are not implemented')
+
     def _get(self, path: str) -> dict:
         with urllib.request.urlopen(f'{self.base_url}{path}', timeout=30) as r:
             return json.loads(r.read())
@@ -216,21 +239,11 @@ class LighterBroker:
 
     def market_order(self, market: Market, symbol: str, position_side: str,
                      qty: float, closing: bool, coi: int, ref_price: float) -> Fill:
-        base = market.scale_size(qty)
-        if base <= 0:
-            raise ValueError(f'{symbol}: size {qty} rounds to zero')
-        ask = _is_ask(position_side, closing)
-        # avg_execution_price bounds an IOC market order; pad against the taker.
-        bound = ref_price * (1 - self.stop_limit_pct) if ask else ref_price * (1 + self.stop_limit_pct)
-        self._send(self._signer.create_market_order(
-            market_index=market.market_id, client_order_index=coi,
-            base_amount=base, avg_execution_price=market.scale_price(bound),
-            is_ask=ask, reduce_only=closing), f'{symbol} market')
-        return Fill(symbol, position_side, market.unscale_size(base), ref_price,
-                    'EXIT' if closing else 'ENTRY')
+        self._require_verified_execution()
 
     def place_stop(self, market: Market, symbol: str, position_side: str,
                    qty: float, trigger: float, coi: int) -> OrderRef:
+        self._require_verified_execution()
         base = market.scale_size(qty)
         ask = _is_ask(position_side, closing=True)
         bound = trigger * (1 - self.stop_limit_pct) if ask else trigger * (1 + self.stop_limit_pct)
@@ -254,6 +267,7 @@ class LighterBroker:
         the market has already gone past the target in our favour, so the
         fallback takes the trigger order and accepts the crossing fill.
         """
+        self._require_verified_execution()
         import lighter
         base = market.scale_size(qty)
         ask = _is_ask(position_side, closing=True)
@@ -278,6 +292,7 @@ class LighterBroker:
     def modify_stop(self, market: Market, ref: OrderRef, qty: float, trigger: float) -> None:
         """Amend in place. Never cancel-then-replace: a failure between the two
         would leave the position with no stop at all."""
+        self._require_verified_execution()
         if ref.order_index is None:
             raise RuntimeError('cannot modify a stop with no exchange order index')
         ask_bound = trigger * (1 + self.stop_limit_pct)
@@ -287,6 +302,7 @@ class LighterBroker:
             trigger_price=market.scale_price(trigger)), 'modify stop')
 
     def cancel(self, market: Market, ref: OrderRef) -> None:
+        self._require_verified_execution()
         if ref.order_index is None:
             return
         self._send(self._signer.cancel_order(
