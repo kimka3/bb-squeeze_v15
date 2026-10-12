@@ -24,11 +24,11 @@ def scaled(value, decimals):
 
 
 class ExecutionEngine:
-    def __init__(self, transport, directory, *, timeout=30, sleep=time.sleep, clock=time.monotonic):
+    def __init__(self, transport, directory, *, timeout=30, sleep=time.sleep, clock=time.monotonic, lock_path=None):
         self.transport, self.directory = transport, Path(directory)
         self.timeout, self.sleep, self.clock = timeout, sleep, clock
         # All clients for the same API account must use the same parent lock.
-        self.lock = ProcessLock(self.directory.parent / f'{transport.network}-{transport.account_index}.lock').acquire()
+        self.lock = ProcessLock(lock_path or self.directory.parent / f'{transport.network}-{transport.account_index}.lock').acquire()
         try:
             self.store = IntentStore(self.directory / 'execution.sqlite', transport.network, transport.account_index)
             self.journal = Journal(self.directory)
@@ -62,7 +62,7 @@ class ExecutionEngine:
                 raise UnverifiedExecution('order outcome unknown; retained for recovery, not resubmitted')
             self.sleep(.5)
 
-    def create(self, intent: Intent, size_decimals, price_decimals, *, stop_quantity=None):
+    def create(self, intent: Intent, size_decimals, price_decimals, *, stop_quantity=None, resting=False):
         base = scaled(intent.quantity, size_decimals)
         price = scaled(intent.price, price_decimals)
         trigger = scaled(intent.trigger_price, price_decimals)
@@ -87,7 +87,7 @@ class ExecutionEngine:
                 self.journal.append('submission_uncertain', coi=intent.client_order_index)
         def accept(row, result):
             if stop_quantity is None:
-                return result['terminal']
+                return result['terminal'] or (resting and intent.order_type == 'limit' and row['status'] == 'open')
             if result['terminal']:
                 raise UnverifiedExecution('stop already terminal; inspect position and close residual')
             try:

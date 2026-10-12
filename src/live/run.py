@@ -43,8 +43,28 @@ from live.trader import Trader                                     # noqa: E402
 from live import feed                                              # noqa: E402
 from live import observation                                       # noqa: E402
 from live.runtime_health import RuntimeHealth                      # noqa: E402
+from live.strategy_broker import StrategyBroker                    # noqa: E402
 
 STOP_REQUESTED = threading.Event()
+
+
+def build_authenticated_strategy(config, transport, *, start_ms, writes_enabled=False, account_lock_path=None):
+    """Integration factory. CLI live activation stays gated separately.
+
+Default read-only even with valid credentials; dependency injection permits
+end-to-end Trader tests without submitting real orders.
+"""
+    if config.base_url != transport.host or config.account_index != transport.account_index:
+        raise ValueError('configuration and authenticated account/network differ')
+    if not config.passive_take_profit:
+        raise ValueError('only the existing passive TP policy is integrated')
+    if writes_enabled and account_lock_path is None:
+        raise ValueError('writes require the shared account lock used by every account writer')
+    markets=load_markets(config.base_url,config.lighter_universe)
+    broker=StrategyBroker(transport,markets,config.state_dir/'execution',start_ms=start_ms,
+                          slippage=str(config.max_slippage_pct),writes_enabled=writes_enabled,
+                          account_lock_path=account_lock_path)
+    return Trader(config,broker,markets,Journal(config.state_dir)),markets
 
 
 def atomic_json(path: Path, value) -> None:
@@ -104,7 +124,7 @@ def poll_until(trader, deadline: float, config) -> None:
     The trader service therefore runs after every virtual poll as well.
     """
     broker = trader.broker
-    if not isinstance(broker, PaperBroker):
+    if not isinstance(broker, (PaperBroker,StrategyBroker)):
         time.sleep(max(1.0, deadline - time.time()))
         return
     while time.time() < deadline:
@@ -341,6 +361,11 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         if payload['strategy_data_gaps'] or runtime_coverage is None or not runtime_coverage['coverage_complete']:
             payload['performance_complete'] = False
         atomic_json(config.state_dir / 'report.json', payload)
+    if isinstance(trader.broker,StrategyBroker):
+        atomic_json(config.state_dir/'report.json',{
+            **trader.broker.last_report,'updated_ms':now_ms,'classification':'authenticated_account_ledger',
+            'strategy_data_gaps':trader.data_gaps,'runtime_coverage':runtime_coverage,
+            'trader_halted':trader.halted,'halt_reasons':trader.halt_reasons,'performance_complete':False})
     atomic_json(config.state_dir / 'runner_status.json', {
         'updated_ms': now_ms, 'pid': os.getpid(), 'mode': config.mode,
         'last_bar_ms': trader.last_bar_ms,
@@ -412,7 +437,7 @@ def run_loop(trader, markets, config, deadline: float) -> None:
             if now >= next_poll_at:
                 poll_failed = False
                 try:
-                    if isinstance(trader.broker, PaperBroker):
+                    if isinstance(trader.broker, (PaperBroker,StrategyBroker)):
                         for fill in trader.broker.poll():
                             trader.journal.append('paper_fill', **fill.__dict__)
                             print(f'SIMULATED FILL {fill.symbol} {fill.role} qty={fill.qty} price={fill.price}', flush=True)
@@ -513,8 +538,9 @@ def main() -> int:
               'was not passed.', file=sys.stderr)
         return 2
     if config.mode == 'live':
-        print('Live execution is disabled: terminal exchange fill/protection confirmation '
-              'has not been integrated and verified. Use --mode paper.', file=sys.stderr)
+        print('Live strategy activation is disabled: authenticated integration exists, '
+              'but cost completeness and production protection/recovery gates remain. '
+              'Use read-only live.strategy_audit for execution evidence.', file=sys.stderr)
         return 2
 
     if a.depth_scan or a.capacity:

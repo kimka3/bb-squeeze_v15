@@ -91,14 +91,65 @@ execution is performed by the user, not by the assistant. Do not confuse local
 tests, authenticated reads, stop registration, or a one-shot execution check
 with proof of production strategy readiness or profitability.
 
-## Remaining implementation and operational gates
+## Authenticated strategy integration (2026-10-12)
 
-1. Complete the human-operated bounded execution check; preserve authenticated
-   response fixtures and cleanup proof. Testnet was declined by the user in
-   favor of this mainnet check. Mainnet and testnet state remain separate.
-2. Integrate paginated per-trade/fee/funding history, position/TP attribution,
-   and the strategy service loop with the new execution engine. Existing order
-   totals alone do not prove partial-TP attribution or a complete cost ledger.
+`strategy_broker.py` now connects the existing `Trader` and shared `live_core`
+to `ExecutionEngine`. `build_authenticated_strategy` constructs this path with
+writes disabled by default. The runner's fast poll and report persistence accept
+this adapter; the production CLI activation gate remains closed. No service is
+installed or started by constructing the adapter. Account equity comes from
+the exchange, not the old paper capital or the withdrawn 10,000 USDC plan.
+
+The existing BCH-excluded universe, 2% per-trade risk, 4% aggregate initial risk,
+BTC-bull short multiplier and entry/exit decision functions remain unchanged.
+If the configured short partial TP cannot satisfy lot/minimum constraints, the
+entry is skipped; sizing is never increased to meet an exchange minimum.
+Strategy client IDs are bounded to Lighter's 48-bit input contract.
+
+The adapter persists order purpose and entry-cycle ownership before submission.
+Order totals and paginated account trades must agree on quantity, quote amount,
+market, side and order identity. A full fill of the owned TP leg arms breakeven;
+a manual reduction or an incomplete TP leg does not. Amendments retain the
+existing stop until the new terms are confirmed. Unknown history, positions or
+foreign active orders block reconciliation/new entries. A rejected passive TP
+is not silently replaced with a different execution policy.
+
+`account_ledger.py` stores immutable trade/funding events, rejects cursor loops,
+deduplicates repeated pages and keeps historical records across restart. Funding
+uses actual signed account cash changes and attributes them to an unambiguous
+owned holding interval. Ambiguous settlement ordering remains unattributed.
+Trade fee fields missing from the API, and nonzero fee fields with unverified
+units, remain unknown. A matching account balance delta does not independently
+certify each fee. Market-wide funding rates are never substituted for settlement.
+
+`python -m live.strategy_audit --config PRIVATE_CONFIG --sessions SESSION_JSON ...
+--output NEW_AUDIT_DIRECTORY` is read-only with respect to the exchange. It can
+reconcile the user's saved bounded checks without constructing a writer or
+altering those sessions. Private account histories/reports stay outside Git.
+
+Additional primary schema references:
+- [Account trade fields](https://github.com/elliottech/lighter-python/blob/main/docs/Trade.md)
+- [Trade pagination](https://github.com/elliottech/lighter-python/blob/main/docs/OrderApi.md#trades)
+- [Position funding fields](https://github.com/elliottech/lighter-python/blob/main/docs/PositionFunding.md)
+- [Account funding query](https://github.com/elliottech/lighter-python/blob/main/docs/AccountApi.md#position_funding)
+
+Synthetic integration tests cover full strategy entry, partial TP followed by
+complete TP, breakeven amendment, time exit, lost replies, rejected TP, restart,
+unknown reductions, account-history pagination and cash-funding attribution.
+They do not certify mainnet partial-TP triggering or outage behavior. The current
+full-history reconciliation is conservative and can require many reads; sustained
+request-budget and publication-lag handling must be validated before activation.
+The complete suite plus the added long-side regression totals 254 passing tests
+(and 15 unittest subtests on Windows). Every account writer must use the same
+account lock path; the factory refuses write-enabled construction without it.
+
+## Remaining operational gates
+
+1. The second human-operated bounded check passed with flat cleanup. Preserve
+   both the first failed check and the successful second check. This does not
+   certify triggered stop fills or partial TP on mainnet.
+2. Resolve missing fee evidence and any nonzero fee-unit/discount interpretation;
+   validate API publication delays and request limits over the intended runtime.
 3. Verify production residual protection, alerting and restart recovery against
    the actual exchange responses. Unknown outcomes must not permit new entries.
 4. Reconcile account equity, fees, funding and margin; enforce the authorized

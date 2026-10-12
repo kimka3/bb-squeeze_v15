@@ -103,6 +103,11 @@ class Trader:
         self.pending_operation = operation
         self._save()  # Write-ahead intent: before ANY broker mutation.
 
+    def _coi(self, bar_ms, symbol, purpose, seq=0):
+        value=client_order_index(bar_ms,symbol,purpose,seq)
+        limit=getattr(self.broker,'max_client_order_index',None)
+        return value % limit if limit else value
+
     @staticmethod
     def _order_ref(ref):
         from .broker import OrderRef
@@ -112,6 +117,8 @@ class Trader:
     def _sync_fills(self, state) -> list[str]:
         """Apply ledger-confirmed changes; a smaller position is not TP proof."""
         notes = []
+        if state.ledger_report and not state.execution_changes_verified:
+            self._halt('account execution history does not reconcile; new entries halted')
         reverse = {v: k for k, v in self.config_symbol_map.items()}
         live = {}
         for lighter_symbol, pos in state.positions.items():
@@ -429,7 +436,7 @@ class Trader:
         market = self.markets[symbol]
         price = float(opens[symbol])
         attempt = self.residual_exits.get(symbol, {}).get('attempt', 0)
-        coi = client_order_index(bar_ms, symbol, f'EXIT_{reason}', seq=attempt)
+        coi = self._coi(bar_ms, symbol, f'EXIT_{reason}', seq=attempt)
         op = {'kind': 'exit', 'symbol': symbol, 'bar_ms': bar_ms, 'reason': reason,
               'coi': coi, 'qty': p['qty'], 'side': p['side'], 'attempt': attempt}
         if self.pending_operation is not None:
@@ -512,7 +519,15 @@ class Trader:
             out.skipped.append((symbol, reason))
             return
 
-        coi = client_order_index(bar_ms, symbol, 'ENTRY')
+        validate=getattr(self.broker,'validate_entry',None)
+        if validate:
+            try:
+                validate(market,side,plan.qty,plan.px,self.cfg.tp_fraction,plan.px-2*plan.unit)
+            except ValueError as exc:
+                out.skipped.append((symbol,str(exc)))
+                return
+
+        coi = self._coi(bar_ms, symbol, 'ENTRY')
         op = {'kind': 'entry', 'phase': 'submit', 'symbol': symbol, 'bar_ms': bar_ms,
               'coi': coi, 'side': side, 'plan': list(plan), 'signal_ms': signal_ms,
               'equity': equity, 'breakout': float(rows[symbol].get('x_bb_lower', 0.))}
@@ -540,7 +555,10 @@ class Trader:
         plan = plan._replace(px=fill.price)
         self.positions[symbol] = open_position(
             op['side'], op['bar_ms'], op['signal_ms'], plan, fill.qty,
-            op['equity'], fill.qty * fill.price * self.costs.fee, op['breakout'])
+            op['equity'], (fill.fee_usdc or 0.) if hasattr(self.broker,'ledger') else
+            fill.qty * fill.price * self.costs.fee, op['breakout'])
+        if hasattr(self.broker,'ledger'):
+            self.positions[symbol]['entry_fee_verified']=fill.fee_usdc is not None
         op['phase'] = 'protect'
         self._save()  # Filled exposure survives a failure placing either leg.
         self.journal.append('order_ack', bar_ms=op['bar_ms'], intent=f'entry:{symbol}',
@@ -566,7 +584,7 @@ class Trader:
         if own_operation:
             self._begin_operation({'kind': 'protection', 'symbol': symbol, 'bar_ms': bar_ms})
         refs = self.orders.setdefault(symbol, {})
-        sl_coi = client_order_index(bar_ms, symbol, 'SL', seq=self.protection_generation.get(symbol, 0))
+        sl_coi = self._coi(bar_ms, symbol, 'SL', seq=self.protection_generation.get(symbol, 0))
         if 'SL' not in refs:
             refs['SL'] = self.broker.place_stop(market, symbol, p['side'], p['qty'],
                                                 p['stop'], sl_coi).__dict__
@@ -574,7 +592,7 @@ class Trader:
             self._save()  # A failed TP placement must not lose an accepted SL.
         if (p['side'] == 'SHORT' and self.cfg.tp_fraction > 0
                 and not p['partial_taken'] and 'TP' not in refs):
-            tp_coi = client_order_index(bar_ms, symbol, 'TP')
+            tp_coi = self._coi(bar_ms, symbol, 'TP')
             refs['TP'] = self.broker.place_take_profit(
                 market, symbol, p['side'], p['qty'] * self.cfg.tp_fraction,
                 p['tp2r'], tp_coi).__dict__

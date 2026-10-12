@@ -37,6 +37,7 @@ class Fill:
     qty: float
     price: float
     role: str            # ENTRY | STOP | TP2R | BB_MID | TIME | ...
+    fee_usdc: float | None = None  # None means not reconciled, never inferred zero.
 
 
 @dataclass
@@ -59,6 +60,7 @@ class AccountState:
     # A position endpoint by itself is insufficient evidence.
     execution_changes_verified: bool = False
     active_orders_verified: bool = False
+    ledger_report: dict = field(default_factory=dict)
 
     @property
     def margin_ratio(self) -> float:
