@@ -282,7 +282,11 @@ def prepare_frames(config):
 def run_once(trader, markets, config, frames=None, deadline=float('inf'), coverage=None):
     frames = prepare_frames(config) if frames is None else frames
     bar_ms, rows = feed.latest_closed(frames)
-    current = marks(config.base_url, markets)
+    if isinstance(getattr(trader,'broker',None),StrategyBroker):
+        trader.broker.poll()
+        current = dict(trader.broker._marks)
+    else:
+        current = marks(config.base_url, markets)
     if STOP_REQUESTED.is_set() or time.time() >= deadline:
         return None
     now_ms = int(time.time() * 1000)
@@ -290,7 +294,9 @@ def run_once(trader, markets, config, frames=None, deadline=float('inf'), covera
     already_processed = bar_ms <= getattr(trader, 'last_bar_ms', -1)
     # Late bars may restore indicators / manage existing positions, never open
     # the missed signal at an unrelated later price.
-    outcome = trader.on_bar(bar_ms, rows, current, now_ms=now_ms, allow_entries=not late)
+    guard=getattr(getattr(trader,'broker',None),'entry_guard',None)
+    outcome = trader.on_bar(bar_ms, rows, current, now_ms=now_ms,
+                           allow_entries=not late and (guard is None or guard()))
     if coverage is not None and not already_processed:
         if getattr(trader, 'last_bar_ms', -1) == bar_ms:
             # The guard also includes HALT/margin conditions: this is a count
@@ -342,6 +348,10 @@ def parse_until(text: str) -> float:
 
 def persist_report(trader, config, coverage=None, **health) -> None:
     now_ms = int(time.time() * 1000)
+    entry_guard=getattr(trader.broker,'entry_guard',None)
+    if entry_guard is not None:
+        paused=not entry_guard()
+        health.update(entries_paused=paused,entry_pause_observed_ms=now_ms if paused else None)
     runtime_coverage = None
     if coverage is not None:
         coverage.save(now_ms)
@@ -390,6 +400,7 @@ def run_loop(trader, markets, config, deadline: float) -> None:
     bar_future = sample_future = None
     next_bar_at = next_poll_at = next_sample_at = time.time()
     counters = {'poll_errors': 0, 'bar_errors': 0, 'observation_errors': 0,
+                'service_errors': 0,'last_successful_service_ms': None,
                 'successful_polls': 0, 'observations': 0, 'last_error': None,
                 'last_successful_poll_ms': None, 'last_bar_success_ms': None,
                 'last_observation_ms': None}
@@ -456,8 +467,10 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                 # fails. Reconcile them without stale-price close retries.
                 try:
                     trader.service(marks={} if poll_failed else None)
+                    counters['last_successful_service_ms'] = int(time.time() * 1000)
                     coverage.success('service', int(time.time() * 1000))
                 except Exception as exc:
+                    counters['service_errors'] += 1
                     counters['last_error'] = f'service: {exc}'
                     trader.journal.append('service_error', error=str(exc))
                     coverage.failure('service', int(time.time() * 1000), str(exc))

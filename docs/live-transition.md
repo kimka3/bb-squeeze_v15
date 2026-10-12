@@ -1,5 +1,13 @@
 # Live execution transition: not yet enabled
 
+For the latest installed-but-inactive operator path, see
+[production controls](live-production-controls.md) and
+[operation validation](live-operations-validation.md). The historical gates
+below describe earlier stages. Read-only verification now passes; individual fee
+evidence and actual mainnet outage/trigger behavior remain explicitly unproven.
+The separate production entry point requires the human's terminal confirmation
+and acknowledgement of those limitations; installation never starts it.
+
 The completed paper campaign is preserved. Its completion does not establish
 authenticated execution correctness. The strategy CLI and old broker write
 guards remain in place. A separate user-operated `live.live_check` command can

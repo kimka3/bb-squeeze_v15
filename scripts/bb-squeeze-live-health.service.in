@@ -1,0 +1,17 @@
+[Unit]
+Description=BB Squeeze local operational health monitor
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=@STAGE@
+Environment=PYTHONPATH=@STAGE@/src
+ExecStart=/opt/bb-squeeze-live-check/bin/python -m live.production health --config @CONFIG@
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@STATE@
+UMask=0077
+StandardOutput=journal
+StandardError=journal

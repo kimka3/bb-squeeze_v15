@@ -31,6 +31,8 @@ class StrategyBroker:
         self._marks={}; self._mark_sample_ms={}
         self.by_id={m.market_id:(s,m) for s,m in markets.items()}
         self.last_report={}
+        self.entry_guard=None
+        self.initial_allocated_equity=None
 
     def close(self):
         self.ledger.close(); self.engine.close()
@@ -60,6 +62,8 @@ class StrategyBroker:
         return number(qty).quantize(Decimal(1).scaleb(-market.size_decimals),rounding=ROUND_FLOOR)
 
     def validate_entry(self,market,side,qty,price,tp_fraction,tp_price):
+        if self.entry_guard is not None and not self.entry_guard():
+            raise ValueError('operator or operational guard has paused new entries')
         q=self.quantity(market,qty)
         if market.rejects(float(q),price): raise ValueError('entry is below exchange minimum')
         if side=='SHORT' and tp_fraction>0:
@@ -83,6 +87,8 @@ class StrategyBroker:
 
     def market_order(self,market,symbol,position_side,qty,closing,coi,ref_price):
         self._write()
+        if not closing and self.entry_guard is not None and not self.entry_guard():
+            raise UnverifiedExecution('new entries paused')
         if self.engine.store.load(coi) is None:
             state=self.account_state()
             if not state.execution_changes_verified:
@@ -204,8 +210,23 @@ class StrategyBroker:
         report.update(order_roles=costs,execution_changes_verified=verified,
                       funding_attributions=self.ledger.attribute_funding(bindings),
                       funding_scope='settled account cash changes attributed to owned holding intervals')
+        equity=number(account['total_asset_value'])
+        if self.initial_allocated_equity is not None:
+            # Profit can compound, but an unrelated deposit must not silently
+            # increase the user's authorized starting allocation. Unknown fees
+            # cannot inflate sizing beyond the actual current account equity.
+            cash=sum((number(r['quote'])*(1 if r['is_ask'] else -1)
+                      for r in trades if r['coi'] in bindings),Decimal(0))
+            holding=sum((abs(signed(r['position_value']))*(1 if r['sign']==1 else -1)
+                         for r in account['positions'] if number(r['position'])>0),Decimal(0))
+            funding=sum((signed(r['cash_change']) for r in report['funding_attributions']
+                         if r['cycle'] is not None),Decimal(0))
+            allocated=max(Decimal(0),number(self.initial_allocated_equity)+cash+holding+funding)
+            report.update(actual_account_equity=str(equity),allocated_equity=str(min(equity,allocated)),
+                          allocation_scope='initial approved equity plus owned trading and settled funding; capped by actual equity')
+            equity=min(equity,allocated)
         self.last_report=report
-        return AccountState(float(number(account['total_asset_value'])),float(maintenance),out,active_map,
+        return AccountState(float(equity),float(maintenance),out,active_map,
                             verified,True,report)
 
     def poll(self):

@@ -1,0 +1,31 @@
+[Unit]
+Description=BB Squeeze user-authorized live strategy
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@STAGE@
+Environment=PYTHONPATH=@STAGE@/src
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+ExecStart=/opt/bb-squeeze-live-check/bin/python -m live.production run --config @CONFIG@
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@STATE@ @CREDENTIAL_DIR@ @LOCK_DIR@
+ReadOnlyPaths=@KEY_FILE@
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
