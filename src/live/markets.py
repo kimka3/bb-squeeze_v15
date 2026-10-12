@@ -63,15 +63,15 @@ def _get(url: str, timeout: int = 30) -> dict:
         return json.loads(r.read())
 
 
-def load_markets(base_url: str, wanted: dict[str, str]) -> dict[str, Market]:
+def load_markets(base_url: str, wanted: dict[str, str], *, fetch=None) -> dict[str, Market]:
     """Fetch metadata for the strategy universe.
 
     wanted maps strategy symbol (BTCUSDT) -> Lighter symbol (BTC). Raises if any
     market is missing or inactive rather than silently trading a smaller universe.
     """
-    details = {d['symbol']: d for d in
-               _get(f'{base_url}/api/v1/orderBookDetails')['order_book_details']}
-    books = {b['symbol']: b for b in _get(f'{base_url}/api/v1/orderBooks')['order_books']}
+    get = fetch or (lambda path: _get(base_url + path))
+    details = {d['symbol']: d for d in get('/api/v1/orderBookDetails')['order_book_details']}
+    books = {b['symbol']: b for b in get('/api/v1/orderBooks')['order_books']}
     out, missing = {}, []
     for strat_symbol, lighter_symbol in wanted.items():
         d, b = details.get(lighter_symbol), books.get(lighter_symbol)

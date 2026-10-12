@@ -229,7 +229,7 @@ def test_read_only_factory_connects_trader_and_blocks_writes(tmp_path,monkeypatc
     x,b,t=setup(tmp_path/'fixture'); markets=t.markets; b.close()
     config=LiveConfig(mode='live',base_url=x.host,account_index=100,api_key_index=4,
                       state_dir=tmp_path/'factory',universe=tuple(markets))
-    monkeypatch.setattr(runner,'load_markets',lambda *a:markets)
+    monkeypatch.setattr(runner,'load_markets',lambda *a,**kw:markets)
     trader,_=runner.build_authenticated_strategy(config,x,start_ms=START)
     try:
         assert trader.broker.writes_enabled is False

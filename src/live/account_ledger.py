@@ -40,7 +40,11 @@ raises and never replaces a previous successful reconciliation.
     endpoint='/api/v1/trades' if kind=='trades' else '/api/v1/positionFunding'
     params={'account_index':transport.account_index,'limit':100}
     if kind=='trades': params.update(sort_by='timestamp',sort_dir='desc',aggregate='false')
-    else: params.update(start_timestamp=start_ms//1000,end_timestamp=end_ms//1000)
+    else:
+        # Same-second bounds produce HTTP 400 on the observed API. Pad the
+        # server window and filter locally, preserving exact inclusive scope
+        # even when the provider treats a timestamp boundary as exclusive.
+        params.update(start_timestamp=max(0,start_ms//1000-1),end_timestamp=end_ms//1000+1)
     cursor=None; seen=set(); rows=[]; previous=None
     for _ in range(page_limit):
         data=transport.get(endpoint+'?'+urlencode({**params,**({'cursor':cursor} if cursor else {})}))

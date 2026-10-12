@@ -66,6 +66,11 @@ class StrategyBroker:
             half=self.quantity(market,q*number(tp_fraction))
             if market.rejects(float(half),tp_price) or market.rejects(float(q-half),tp_price):
                 raise ValueError('entry cannot support configured partial TP at exchange minimums')
+        if hasattr(self.transport,'budget'):
+            from .request_budget import RequestDeferred
+            try: self.transport.budget.check(24)
+            except RequestDeferred:
+                raise ValueError('insufficient API headroom for entry and protection; entry skipped') from None
 
     def _intent(self,market,side,qty,coi,*,closing,kind,price,trigger='0',tif='immediate-or-cancel'):
         if side not in ('LONG','SHORT'): raise ValueError('invalid position side')
@@ -89,6 +94,8 @@ class StrategyBroker:
                 raise UnverifiedExecution('new entry into an existing position refused')
             if not closing and state.active_orders.get(market.symbol):
                 raise UnverifiedExecution('old active orders must be resolved before re-entry')
+            if not closing and hasattr(self.transport,'budget'):
+                self.transport.budget.check(20)  # leave room for entry reconciliation and protection
         self._bind(coi,symbol,position_side,'EXIT' if closing else 'ENTRY')
         existing=self.engine.store.load(coi)
         intent=existing[0] if existing else self._intent(market,position_side,qty,coi,closing=closing,kind='market',price=ref_price)
@@ -137,6 +144,9 @@ class StrategyBroker:
         self._write(); self.engine.cancel(ref.client_order_index)
 
     def account_state(self):
+        self.engine.reconcile_amendments()
+        active=self.transport.active_orders()
+        active_by_coi={r['client_order_index']:r for r in active}
         bindings=self._bindings(); results={}; expected={}; tp_done={}; costs={}
         for coi,b in bindings.items():
             stored=self.engine.store.load(coi)
@@ -144,7 +154,8 @@ class StrategyBroker:
             intent,old=stored
             if old and old['terminal']: result=old
             else:
-                row=self.transport.order(coi)
+                row=active_by_coi.get(coi)
+                if row is None: row=self.transport.order(coi)
                 if row is None: raise UnverifiedExecution('owned order outcome absent')
                 result=self.engine.store.record(coi,row)
             results[coi]=result
@@ -168,7 +179,7 @@ class StrategyBroker:
                             'fee_usdc':str(totals['fee_usdc']) if totals['fee_usdc'] is not None else None}
         account=self.transport.account(); actual=positions(account)
         if {k:v for k,v in expected.items() if v}!=actual: verified=False
-        active=self.transport.active_orders(); active_map={}
+        active_map={}
         for row in active:
             coi=row.get('client_order_index'); b=bindings.get(coi)
             if b is None: raise UnverifiedExecution('unowned active order; refuse to manage it')
@@ -198,11 +209,18 @@ class StrategyBroker:
                             verified,True,report)
 
     def poll(self):
-        data=self.transport.get('/api/v1/orderBookDetails',private=False)
+        data=self.transport.get('/api/v1/orderBookDetails')
         rows={r['market_id']:r for r in data['order_book_details'] if r.get('market_type')=='perp'}
         now=int(self.clock()*1000)
         values={s:float(number(rows[m.market_id]['mark_price'])) for s,m in self.markets.items()}
         if any(v<=0 for v in values.values()): raise UnverifiedExecution('invalid mark')
         self._marks=values; self._mark_sample_ms={s:now for s in values}
-        self.account_state()
         return []
+
+    def stop_amendment_confirmed(self,coi,qty,trigger):
+        intent,result=self.engine.store.load(coi)
+        _,market=self.by_id[intent.market_index]
+        expected=price_tick(number(trigger),market.price_decimals,upward=intent.is_ask)
+        return (result is not None and not result['terminal'] and
+                number(intent.trigger_price)==expected and
+                number(intent.quantity)==self.quantity(market,qty))

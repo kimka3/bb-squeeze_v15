@@ -14,8 +14,12 @@ import os
 from pathlib import Path
 import stat
 import sys
+import time
+import hashlib
+from collections import deque
 import urllib.error
 import urllib.request
+from .request_budget import RequestBudget
 
 HOSTS = {'mainnet': 'https://mainnet.zklighter.elliot.ai',
          'testnet': 'https://testnet.zklighter.elliot.ai'}
@@ -79,6 +83,9 @@ class LighterTransport:
         self.host, self.network = HOSTS[network], network
         self.account_index, self.api_key_index = account_index, api_key_index
         self.expected_address = expected_address.lower()
+        scope = hashlib.sha256((network + self.expected_address).encode()).hexdigest()[:24]
+        self.budget = RequestBudget(Path(key_file).parent / ('requests-' + scope + '.sqlite'))
+        self.request_samples = deque(maxlen=1000)
         self.loop = asyncio.new_event_loop()
         self.client = None
         self.opener = urllib.request.build_opener(NoRedirect())
@@ -105,10 +112,16 @@ class LighterTransport:
             self.client = None
         if not self.loop.is_closed():
             self.loop.close()
+        if getattr(self, 'budget', None) is not None:
+            self.budget.close()
+            self.budget = None
 
     def get(self, path, *, private=True):
         if not path.startswith('/api/v1/') or any(c in path for c in ('\r', '\n', '#')):
             raise ValueError('invalid API path')
+        self.budget.check(consume=True)
+        started = time.monotonic()
+        status = 'error'
         headers = {}
         if private:
             with quiet_native():
@@ -120,8 +133,19 @@ class LighterTransport:
         try:
             with self.opener.open(urllib.request.Request(self.host + path, headers=headers), timeout=10) as r:
                 data = json.load(r)
+                status = r.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            if exc.code in (405, 429):
+                try: delay = float(exc.headers.get('Retry-After', 60))
+                except (TypeError, ValueError): delay = 60
+                self.budget.defer(delay)
+            raise RuntimeError(f'API read failed (HTTP {exc.code}); response suppressed') from None
         except Exception as exc:
             raise RuntimeError(f'API read failed ({type(exc).__name__}); response suppressed') from None
+        finally:
+            self.request_samples.append({'endpoint': path.split('?')[0], 'status': status,
+                                         'seconds': time.monotonic()-started})
         if not isinstance(data, dict) or data.get('code') != 200:
             raise RuntimeError('API returned a non-success payload')
         return data
@@ -157,6 +181,10 @@ class LighterTransport:
         # An error or lost response is ambiguous. The execution engine must
         # reconcile the durable intent; it must never blindly resend it.
         try:
+            try: self.budget.check(consume=True)
+            except Exception:
+                coro.close()
+                raise
             with quiet_native():
                 _, response, error = self.loop.run_until_complete(asyncio.wait_for(coro, timeout=15))
             if error is not None or response is None or response.code != 200:

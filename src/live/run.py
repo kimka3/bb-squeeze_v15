@@ -60,7 +60,9 @@ end-to-end Trader tests without submitting real orders.
         raise ValueError('only the existing passive TP policy is integrated')
     if writes_enabled and account_lock_path is None:
         raise ValueError('writes require the shared account lock used by every account writer')
-    markets=load_markets(config.base_url,config.lighter_universe)
+    if config.poll_seconds < 15:
+        raise ValueError('authenticated REST strategy requires poll_seconds >= 15 for request headroom')
+    markets=load_markets(config.base_url,config.lighter_universe,fetch=transport.get)
     broker=StrategyBroker(transport,markets,config.state_dir/'execution',start_ms=start_ms,
                           slippage=str(config.max_slippage_pct),writes_enabled=writes_enabled,
                           account_lock_path=account_lock_path)

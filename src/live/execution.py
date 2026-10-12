@@ -118,6 +118,35 @@ class ExecutionEngine:
         self.journal.append('durable_mutation', mutation=identity, value=value)
         return True
 
+    def reconcile_amendments(self):
+        """Read-only recovery after venue acceptance but before SQLite commit.
+
+        Do not verify an amended row against the stale pre-crash intent. Never
+        retransmit an uncertain amendment from this reconciliation path.
+        """
+        pending=self.store.db.execute('SELECT id,value FROM mutations WHERE complete=0').fetchall()
+        for mid,encoded in pending:
+            if not mid.startswith('amend:'): continue
+            replacement=Intent(**json.loads(encoded))
+            old,previous=self.store.load(replacement.client_order_index)
+            row=self.transport.order(replacement.client_order_index)
+            try:
+                result=verify_order(row,replacement)
+                if not result['terminal']: verify_stop(row,replacement,replacement.quantity)
+            except UnverifiedExecution:
+                result=verify_order(row,old)
+                if not result['terminal']:
+                    verify_stop(row,old,old.quantity)  # uncertainty remains blocked
+                    continue
+                encoded=json.dumps(asdict(old),sort_keys=True)
+            if previous and result['order_index']!=previous['order_index']:
+                raise UnverifiedExecution('amend recovery changed order identity')
+            with self.store.db:
+                self.store.db.execute('UPDATE intents SET intent=?,result=? WHERE coi=?',
+                    (encoded,json.dumps(result),str(replacement.client_order_index)))
+                self.store.db.execute('UPDATE mutations SET complete=1 WHERE id=?',(mid,))
+            self.journal.append('recovered_stop_amendment',coi=replacement.client_order_index,row=row)
+
     def cancel(self, coi):
         existing = self.store.load(coi)
         if not existing:

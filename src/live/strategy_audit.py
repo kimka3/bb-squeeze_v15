@@ -37,6 +37,9 @@ def audit(transport,sessions,output,*,clock=time.time):
         trades=ledger.events('trade'); funding=ledger.events('funding')
         unowned=[r['trade_id'] for r in trades if r['coi'] not in owned]
         account=transport.account(); active=transport.active_orders()
+        limits=transport.get(f'/api/v1/accountLimits?account_index={transport.account_index}')
+        fee_policy={k:limits.get(k) for k in ('user_tier','user_tier_name','current_maker_fee_tick',
+                                            'current_taker_fee_tick','user_tier_last_update')}
         change=signed(account['total_asset_value'])-signed(sessions[0]['equity_before'])
         cash=sum((number(r['quote'])*(1 if r['is_ask'] else -1) for r in trades),Decimal(0))
         funding_cash=sum((signed(r['cash_change']) for r in funding),Decimal(0))
@@ -47,6 +50,11 @@ def audit(transport,sessions,output,*,clock=time.time):
             'equity_before':sessions[0]['equity_before'],'equity_after':account['total_asset_value'],
             'equity_change':str(change),'trade_cash_change':str(cash),
             'residual_before_unknown_costs':str(change-cash-funding_cash),
+            'current_fee_policy':fee_policy,
+            'fee_policy_scope':'current snapshot only; missing trade fields and historical tier semantics remain unverified',
+            'fee_policy_zero_now':(fee_policy['user_tier']=='standard' and
+                type(fee_policy['current_maker_fee_tick']) is int and fee_policy['current_maker_fee_tick']==0 and
+                type(fee_policy['current_taker_fee_tick']) is int and fee_policy['current_taker_fee_tick']==0),
             'orders_submitted_by_audit':0,'strategy_live_enabled':False}
         save(output/'report.json',result)
         return result

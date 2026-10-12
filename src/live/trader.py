@@ -167,7 +167,9 @@ class Trader:
                          if math.isfinite(value) and value > 0 and
                          (samples is None or
                           (s in samples and 0 <= now_ms - samples[s] <= max_age))}
-        out = BarOutcome(now_ms, self.broker.account_state().equity)
+        initial_state = self.broker.account_state()
+        out = BarOutcome(now_ms, initial_state.equity)
+        state_may_change = bool(self.orphan_orders or self._needs_recovery)
         for symbol, refs in list(self.orphan_orders.items()):
             unresolved = {}
             for purpose, ref in refs.items():
@@ -191,7 +193,7 @@ class Trader:
                     self.pending.clear()
                 self._needs_recovery = False
                 self._save()
-        state = self.broker.account_state()
+        state = self.broker.account_state() if state_may_change else initial_state
         out.reasons += self._sync_fills(state)
         margin = guards.check_margin(state, self.config)
         if margin.halt:
@@ -271,9 +273,17 @@ class Trader:
                 # A simulator exposes an exact active-order ledger. For other
                 # adapters no acknowledgement is fabricated from position size.
                 state = self.broker.account_state()
+                if (state.execution_changes_verified and
+                        self.config_symbol_map[op['symbol']] not in state.positions):
+                    self.pending_operation = None
+                    self._save()  # subsequent fill sync cancels remaining protection
+                    return
                 active = state.active_orders.get(self.config_symbol_map[op['symbol']], [])
                 match = next((o for o in active if o.get('client_order_index') == op['coi']
                               and o.get('trigger') == op['trigger']), None)
+                check = getattr(self.broker, 'stop_amendment_confirmed', None)
+                if check and check(op['coi'], op['qty'], op['trigger']):
+                    match = next((o for o in active if o.get('client_order_index') == op['coi']), None)
                 if not state.active_orders_verified or match is None:
                     self._halt('stop amendment outcome unknown; manual reconciliation required')
                     return
