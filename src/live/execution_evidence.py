@@ -115,6 +115,7 @@ def verify_stop(row: dict, intent: Intent, position_quantity: str) -> dict:
     result = verify_order(row, intent)
     if (not intent.order_type.startswith('stop-loss') or not intent.reduce_only or
             row['status'] != 'open' or row.get('trigger_status') != 'ready' or
+            number(result['filled_qty']) != 0 or
             number(position_quantity) <= 0 or
             number(result['remaining_qty']) < number(position_quantity)):
         raise UnverifiedExecution('stop is not confirmed ready for the full position')
@@ -182,3 +183,7 @@ class IntentStore:
         row = self.db.execute('SELECT result FROM intents WHERE coi=?', (str(coi),)).fetchone()
         result = json.loads(row[0]) if row and row[0] else None
         return result if result and result['terminal'] else None
+
+    def load(self, coi: int):
+        row = self.db.execute('SELECT intent, result FROM intents WHERE coi=?', (str(coi),)).fetchone()
+        return (Intent(**json.loads(row[0])), json.loads(row[1]) if row[1] else None) if row else None
