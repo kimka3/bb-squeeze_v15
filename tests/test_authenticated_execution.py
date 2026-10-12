@@ -167,6 +167,37 @@ def test_account_missing_positions_not_treated_as_flat():
         positions({})
 
 
+@pytest.mark.parametrize('mark', ['2501', '2512.50'])
+def test_price_move_inside_reviewed_limit_preserves_original_order_terms(tmp_path, mark):
+    x=Exchange()
+    x.get=lambda *args, **kwargs: {'order_book_details':[{**DETAIL, 'mark_price':mark}]}
+    e=ExecutionEngine(x,tmp_path/'check',timeout=0)
+    plan=minimum_plan(DETAIL)
+    try:
+        result=perform(x,e,plan,tmp_path/'check'/'session.json')
+        assert result['execution_check_passed']
+        entry=x.sent[0]
+        assert entry.price==plan['entry_price_bound']=='2512.50'
+        assert entry.quantity==plan['quantity']
+        assert Decimal(entry.price)*Decimal(entry.quantity)==Decimal(plan['max_entry_notional'])
+    finally:
+        e.close()
+
+
+def test_price_above_reviewed_limit_refuses_before_session_or_submission(tmp_path):
+    x=Exchange()
+    x.get=lambda *args, **kwargs: {'order_book_details':[{**DETAIL, 'mark_price':'2512.51'}]}
+    e=ExecutionEngine(x,tmp_path/'check',timeout=0)
+    path=tmp_path/'check'/'session.json'
+    try:
+        with pytest.raises(RuntimeError, match='price exceeds reviewed bound'):
+            perform(x,e,minimum_plan(DETAIL),path)
+        assert not path.exists()
+        assert x.sent==[]
+    finally:
+        e.close()
+
+
 def test_unknown_remote_id_refuses_new_submission(tmp_path):
     x=Exchange(); x.submit(buy(),41,251250,0)
     e=ExecutionEngine(x,tmp_path/'check',timeout=0)

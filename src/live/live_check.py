@@ -184,7 +184,9 @@ def perform(transport, engine, plan, path):
     for field in ('market_id','size_decimals','price_decimals','quantity'):
         if current[field] != plan[field]:
             raise RuntimeError('market/minimum changed; generate a new preview')
-    if number(current['entry_price_bound']) > number(plan['entry_price_bound']):
+    # Keep the reviewed order limit fixed. Reapplying the slippage buffer to
+    # the latest mark would reject even a tiny move within that approved limit.
+    if number(current['reference_mark']) > number(plan['entry_price_bound']):
         raise RuntimeError('price exceeds reviewed bound; generate a new preview')
     account = transport.account()
     if positions(account) or transport.active_orders():

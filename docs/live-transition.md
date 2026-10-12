@@ -35,7 +35,9 @@ must remain unknown; absence does not authorize retransmission. Matching order
 totals alone cannot prove that a position change was a strategy TP, or reconcile
 fees, funding, external/manual orders or liquidation.
 
-Validation: 224 tests and 15 subtests passed locally. New lifecycle cases cover
+Validation: 227 tests and 15 subtests passed locally. Price movement within the
+reviewed limit preserves the original order price and quantity; movement above
+that limit is rejected before session creation or submission. New lifecycle cases cover
 lost submission replies, restart, partial close residuals, stop rejection with
 cleanup, repeated cleanup, unknown IDs, stop amendment and duplicate prevention.
 These are synthetic exchange fixtures, not real execution results.
