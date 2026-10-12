@@ -90,10 +90,11 @@ class ExecutionEngine:
                 return result['terminal']
             if result['terminal']:
                 raise UnverifiedExecution('stop already terminal; inspect position and close residual')
-            if row['status'] == 'open' and row.get('trigger_status') == 'ready':
+            try:
                 verify_stop(row, intent, stop_quantity)
-                return True
-            return False
+            except UnverifiedExecution:
+                return False
+            return True
         return self._wait(intent.client_order_index, accept)
 
     def recover(self, coi):

@@ -27,13 +27,14 @@ class Exchange:
         self.partial_close=False
         self.hide_order=False
         self.cancel_calls=0
+        self.pending_stop=False
 
     def account(self):
         return {'positions':[] if not self.qty else [{'market_id':0,'position':str(self.qty),'sign':1}],
                 'available_balance':'300','total_asset_value':'300'}
 
     def active_orders(self):
-        return [r for r in self.rows.values() if r['status']=='open']
+        return [r for r in self.rows.values() if r['status'] in {'open','pending'}]
 
     def get(self, path, private=False):
         return {'order_book_details':[DETAIL]}
@@ -59,6 +60,9 @@ class Exchange:
             'price':intent.price,'trigger_price':intent.trigger_price,'initial_base_amount':intent.quantity,
             'filled_base_amount':str(fill),'filled_quote_amount':str(fill*2500),
             'remaining_base_amount':str(qty-fill),'status':status,'trigger_status':'ready'}
+        if intent.order_type=='stop-loss' and self.pending_stop and not self.reject_stop:
+            self.rows[intent.client_order_index].update(status='pending', trigger_status='mark-price',
+                trigger_time=0, parent_order_index=0)
         if self.lost_reply:
             raise RuntimeError('simulated response lost after acceptance')
 
@@ -138,12 +142,13 @@ def test_check_flat_cleanup_even_after_stop_failure(tmp_path,lost,partial,reject
     e.close()
 
 
-def test_stop_amend_verified_and_no_loosening(tmp_path):
-    x=Exchange(); e=ExecutionEngine(x,tmp_path/'check',timeout=0)
+@pytest.mark.parametrize('pending', [False,True])
+def test_stop_amend_verified_and_no_loosening(tmp_path,pending):
+    x=Exchange(); x.pending_stop=pending; e=ExecutionEngine(x,tmp_path/'check',timeout=0)
     stop=Intent(100,0,2,True,True,'0.0041','stop-loss','immediate-or-cancel','2462.62','2475')
     e.create(stop,4,2,stop_quantity='0.0041')
     tighter=Intent(100,0,2,True,True,'0.0041','stop-loss','immediate-or-cancel','2472.57','2485')
-    assert e.amend_stop(2,tighter,4,2)['status']=='open'
+    assert e.amend_stop(2,tighter,4,2)['status']==('pending' if pending else 'open')
     assert e.store.load(2)[0]==tighter
     with pytest.raises(UnverifiedExecution):
         e.amend_stop(2,stop,4,2)
@@ -165,6 +170,19 @@ def test_preview_does_not_authorize_more_than_cap_or_existing_position(tmp_path)
 def test_account_missing_positions_not_treated_as_flat():
     with pytest.raises(UnverifiedExecution):
         positions({})
+
+
+def test_pending_mark_price_stop_is_confirmed_then_canceled_after_close(tmp_path):
+    x=Exchange(); x.pending_stop=True
+    e=ExecutionEngine(x,tmp_path/'check',timeout=0)
+    try:
+        result=perform(x,e,minimum_plan(DETAIL),tmp_path/'check'/'session.json')
+        assert result['stop_registered'] and result['execution_check_passed']
+        assert result['stop_result']['status']=='pending'
+        assert result['cleanup']=='confirmed_flat_no_active_orders'
+        assert x.qty==0 and x.active_orders()==[] and x.cancel_calls==1
+    finally:
+        e.close()
 
 
 @pytest.mark.parametrize('mark', ['2501', '2512.50'])

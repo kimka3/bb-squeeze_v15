@@ -93,6 +93,22 @@ def test_restart_or_lost_reply_never_allows_duplicate_submission(tmp_path):
     third.close()
 
 
+@pytest.mark.parametrize('changed', [None, {'trigger_status':'parent-order'},
+    {'trigger_status':'ready'}, {'parent_order_index':7}, {'parent_order_index':None},
+    {'trigger_time':1}, {'trigger_time':None}, {'trigger_time':False},
+    {'status':'in-progress'}, {'remaining_base_amount':'9'}, {'reduce_only':False}])
+def test_observed_standalone_pending_stop_requires_full_untriggered_protection(changed):
+    i=intent(reduce_only=True,order_type='stop-loss',trigger_price='2.2')
+    r=row(reduce_only=True,type='stop-loss',trigger_price='2.2',
+        filled_base_amount='0',filled_quote_amount='0',remaining_base_amount='10',
+        status='pending',trigger_status='mark-price',trigger_time=0,parent_order_index=0)
+    if changed is None:
+        assert verify_stop(r,i,'10')['remaining_qty']=='10'
+    else:
+        with pytest.raises(UnverifiedExecution):
+            verify_stop({**r,**changed},i,'10')
+
+
 def test_network_account_and_intent_identity_cannot_change(tmp_path):
     p = tmp_path/'execution.sqlite'
     store = IntentStore(p, 'testnet', 100)

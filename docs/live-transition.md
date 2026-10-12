@@ -15,8 +15,10 @@ order, a terminal partial fill and a confirmed zero-fill cancellation. Filled
 base/quote totals determine the execution average, never requested quantity or
 reference price. Fees and position reconciliation are explicitly unverified.
 
-A full-position stop must be observed open, ready and reduce-only, with matching
-terms and sufficient remaining size. Unknown response fields/statuses fail
+A full-position stop must be observed reduce-only with matching terms and
+sufficient remaining size. Standalone untriggered stops use `pending/mark-price`
+with zero trigger time and no parent dependency; `open/ready` is also recognized.
+Unknown response fields/statuses fail
 closed. Intent reservation commits to SQLite before a future send operation;
 an unresolved ID cannot be reserved again after restart or by another connection.
 Regressed or conflicting observations are refused. `authenticated.py` adds the
@@ -29,18 +31,26 @@ Source contract inspected on 2026-10-12:
 - [Official Order model](https://github.com/elliottech/lighter-python/blob/main/lighter/models/order.py)
 - [Official authenticated order query](https://github.com/elliottech/lighter-python/blob/main/docs/OrderApi.md#account_orders)
 - [Official Account Index explanation](https://apidocs.lighter.xyz/docs/account-index)
+- [Official conditional order construction](https://github.com/elliottech/lighter-prover/blob/main/circuit/src/transactions/l2_create_order.rs): conditional orders are inserted as pending mark-price-triggered orders.
 
 The documented client-ID query has a bounded history window. Missing results
 must remain unknown; absence does not authorize retransmission. Matching order
 totals alone cannot prove that a position change was a strategy TP, or reconcile
 fees, funding, external/manual orders or liquidation.
 
-Validation: 227 tests and 15 subtests passed locally. Price movement within the
+Validation: 240 tests and 15 subtests passed locally. Price movement within the
 reviewed limit preserves the original order price and quantity; movement above
 that limit is rejected before session creation or submission. New lifecycle cases cover
 lost submission replies, restart, partial close residuals, stop rejection with
 cleanup, repeated cleanup, unknown IDs, stop amendment and duplicate prevention.
 These are synthetic exchange fixtures, not real execution results.
+
+A user-operated mainnet check on 2026-10-12 filled the entry and close, but the
+old `open/ready`-only stop check timed out on `pending/mark-price`. Cleanup
+confirmed a flat account and no active orders. That recorded check remains
+failed; the fix does not rewrite its result or prove an actual stop-trigger fill.
+Regression cases now include the observed pending state, parent dependencies,
+missing trigger metadata, insufficient size, and pending-stop amendment/cancel.
 
 ## User-operated minimum execution check
 

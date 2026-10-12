@@ -113,8 +113,15 @@ def verify_order(row: dict, intent: Intent) -> dict:
 
 def verify_stop(row: dict, intent: Intent, position_quantity: str) -> dict:
     result = verify_order(row, intent)
+    # Lighter standalone conditional orders await the mark-price trigger in
+    # pending state. Parent-order dependencies are not armed protection.
+    pending_mark = (row.get('status') == 'pending' and
+                    row.get('trigger_status') == 'mark-price' and
+                    type(row.get('trigger_time')) is int and row['trigger_time'] == 0 and
+                    type(row.get('parent_order_index')) is int and row['parent_order_index'] == 0)
+    open_ready = row.get('status') == 'open' and row.get('trigger_status') == 'ready'
     if (not intent.order_type.startswith('stop-loss') or not intent.reduce_only or
-            row['status'] != 'open' or row.get('trigger_status') != 'ready' or
+            not (pending_mark or open_ready) or number(intent.trigger_price) <= 0 or
             number(result['filled_qty']) != 0 or
             number(position_quantity) <= 0 or
             number(result['remaining_qty']) < number(position_quantity)):
