@@ -13,6 +13,14 @@ class RequestDeferred(RuntimeError):
         super().__init__(f'API request deferred for {self.retry_after:.1f}s; preserve orders and retry reads')
 
 
+class EntryDeferred(ValueError):
+    """No order intent exists: the candidate may be retried before its deadline."""
+    def __init__(self, cause):
+        self.retry_after = cause.retry_after
+        self.details = getattr(cause, 'details', {})
+        super().__init__('insufficient API headroom for entry and protection; entry deferred')
+
+
 class RequestBudget:
     def __init__(self, path, *, limit=55, clock=time.time):
         self.clock, self.limit = clock, limit
@@ -34,7 +42,12 @@ class RequestBudget:
             delay = max(0., (pause[0]-now) if pause else 0.)
             if len(stamps)+slots > self.limit:
                 delay = max(delay, stamps[min(len(stamps)-1, len(stamps)+slots-self.limit-1)]+60.1-now)
-            if delay > 0: raise RequestDeferred(delay)
+            if delay > 0:
+                error = RequestDeferred(delay)
+                error.details = {'used':len(stamps), 'limit':self.limit,
+                                 'required':slots, 'window_seconds':60.1,
+                                 'cooldown_until':pause[0] if pause else None}
+                raise error
             if consume: self.db.execute('INSERT INTO requests VALUES(?)', (now,))
 
     def defer(self, seconds=60):

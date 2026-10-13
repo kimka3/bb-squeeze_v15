@@ -29,6 +29,7 @@ from trade_core import Costs
 from . import guards
 from .broker import Fill
 from .journal import client_order_index
+from .request_budget import EntryDeferred, RequestDeferred
 
 
 @dataclass
@@ -76,6 +77,93 @@ class Trader:
         self.data_gaps = list(snap.get('data_gaps', []))
         self.protection_generation = dict(snap.get('protection_generation', {}))
         self._needs_recovery = bool(self.pending_operation or self.inflight_bar_ms)
+        # Unsubmitted candidates are deliberately not restored after a restart.
+        self.deferred_entries = None
+
+    def _entry_now_ms(self):
+        return int(getattr(self.broker, 'clock', time.time)() * 1000)
+
+    def _defer_entries(self, bar_ms, rows, requests, error):
+        now = self._entry_now_ms()
+        deadline = bar_ms + H4 + self.config.bar_grace_seconds * 1000
+        retry_at = now + max(250, math.ceil(error.retry_after * 1000))
+        self.deferred_entries = {'bar_ms':bar_ms, 'rows':rows.copy(),
+                                 'requests':{s:requests[s] for s in self.universe if s in requests}, 'deadline_ms':deadline,
+                                 'retry_at_ms':retry_at}
+        self.journal.append('entry_deferred', bar_ms=bar_ms, symbols=list(requests),
+                            deadline_ms=deadline, retry_at_ms=retry_at,
+                            budget=getattr(error, 'details', {}))
+
+    def retry_deferred_entries(self):
+        """Re-evaluate only unsubmitted candidates, never re-run a closed bar."""
+        batch = self.deferred_entries
+        if batch is None:
+            return None
+        now = self._entry_now_ms()
+        guard = getattr(self.broker, 'entry_guard', None)
+        if (now >= batch['deadline_ms'] or now < batch['bar_ms']+H4
+                or self.halted or self.pending_operation or self.data_gaps
+                or (guard is not None and not guard())):
+            self.journal.append('entry_deferred_discarded', bar_ms=batch['bar_ms'],
+                                symbols=list(batch['requests']),
+                                reason='deadline, clock or operational guard')
+            self.deferred_entries = None
+            return None
+        if now < batch['retry_at_ms']:
+            return None
+        try:
+            budget = getattr(getattr(self.broker, 'transport', None), 'budget', None)
+            if budget is not None:
+                # Five refresh/service reads plus four sizing reads, followed
+                # by the unchanged 24-slot guard. Extra pages are checked again.
+                budget.check(33)
+            # Protection has priority. Refresh marks and service existing risk
+            # before considering a deferred candidate. Never sleep here.
+            self.broker.poll()
+            protected = self.service(now_ms=self._entry_now_ms())
+            if protected.halted:
+                self.deferred_entries = None
+                return protected
+            marks = dict(self.broker._marks)
+            rows = batch['rows']
+            _, blocked = guards.check_basis({s:float(r['close']) for s,r in rows.items()},
+                                             marks, self.config)
+            out = BarOutcome(batch['bar_ms'], protected.equity)
+            for symbol in list(batch['requests']):
+                if self._entry_now_ms() >= batch['deadline_ms']:
+                    break
+                if symbol in self.positions or symbol in blocked or symbol not in marks:
+                    batch['requests'].pop(symbol)
+                    out.skipped.append((symbol, 'deferred candidate no longer eligible'))
+                    continue
+                state = self.broker.account_state()
+                margin = guards.check_margin(state, self.config)
+                mismatch = guards.reconcile(self.positions, state, self.config_symbol_map)
+                if (margin.block_entries or mismatch.halt or not state.execution_changes_verified
+                        or self.residual_exits or self.orphan_orders):
+                    self.deferred_entries = None
+                    out.skipped.append((symbol, 'deferred entry blocked by fresh account state'))
+                    return out
+                self.broker.entry_deadline_ms = batch['deadline_ms']
+                try:
+                    result = self._enter(symbol, batch['requests'][symbol], marks, rows,
+                                         batch['bar_ms']+H4, out, state.equity, entry_state=state)
+                finally:
+                    self.broker.entry_deadline_ms = None
+                if isinstance(result, EntryDeferred):
+                    self._defer_entries(batch['bar_ms'], rows, batch['requests'], result)
+                    return out
+                batch['requests'].pop(symbol)
+                if self.halted or self.pending_operation:
+                    break
+            self.journal.append('entry_retry_result', bar_ms=batch['bar_ms'],
+                                entries=out.entries, skipped=out.skipped,
+                                discarded=list(batch['requests']))
+            self.deferred_entries = None
+            return out
+        except RequestDeferred as exc:
+            self._defer_entries(batch['bar_ms'], batch['rows'], batch['requests'], exc)
+            return None
 
     # -- state ------------------------------------------------------------- #
 
@@ -317,6 +405,7 @@ class Trader:
             # a placeholder zero here looks exactly like a wiped account.
             return BarOutcome(bar_ms, state.equity, halted=self.halted,
                               reasons=[f'bar {bar_ms} already processed'])
+        self.deferred_entries = None  # no carry-over into another signal bar
         if self.last_bar_ms and bar_ms - self.last_bar_ms > H4:
             gap = {'previous_bar_ms': self.last_bar_ms, 'observed_bar_ms': bar_ms,
                    'unobserved_ms': bar_ms - self.last_bar_ms - H4,
@@ -420,8 +509,20 @@ class Trader:
             # entry in the same bar sizes against a slightly smaller account —
             # which is exactly what the backtest does when it recomputes
             # wealth=eq(opens) inside its allocation loop.
-            self._enter(symbol, req, opens, rows, entry_ms, out,
-                        self.broker.account_state().equity)
+            entry_state = self.broker.account_state()
+            bounded = hasattr(self.broker, 'entry_deadline_ms')
+            if bounded:
+                self.broker.entry_deadline_ms = entry_ms + self.config.bar_grace_seconds*1000
+            try:
+                result = self._enter(symbol, req, opens, rows, entry_ms, out,
+                                     entry_state.equity, entry_state=entry_state)
+            finally:
+                if bounded:
+                    self.broker.entry_deadline_ms = None
+            if isinstance(result, EntryDeferred):
+                self._defer_entries(bar_ms, rows, {symbol:req, **self.pending}, result)
+                self.pending.clear()
+                break  # preserve canonical order for the remaining candidates
 
         # 3. bookkeeping
         self.last_bar_ms = bar_ms
@@ -514,7 +615,7 @@ class Trader:
             raise RuntimeError('invalid confirmed fill')
 
     def _enter(self, symbol: str, req, opens: dict, rows: dict,
-               bar_ms: int, out: BarOutcome, equity: float) -> None:
+               bar_ms: int, out: BarOutcome, equity: float, entry_state=None):
         side, atr, signal_ms = req
         market = self.markets[symbol]
         plan = plan_entry(symbol, side, atr, equity, opens, self.positions,
@@ -533,9 +634,22 @@ class Trader:
         if validate:
             try:
                 validate(market,side,plan.qty,plan.px,self.cfg.tp_fraction,plan.px-2*plan.unit)
+            except EntryDeferred as exc:
+                out.skipped.append((symbol,str(exc)))
+                return exc
             except ValueError as exc:
                 out.skipped.append((symbol,str(exc)))
                 return
+
+        deadline = getattr(self.broker, 'entry_deadline_ms', None)
+        guard = getattr(self.broker, 'entry_guard', None)
+        if ((deadline is not None and self._entry_now_ms() >= deadline)
+                or (guard is not None and not guard())):
+            out.skipped.append((symbol, 'entry deadline elapsed or entries paused'))
+            return
+        offer = getattr(self.broker, 'offer_entry_state', None)
+        if offer and entry_state is not None:
+            offer(entry_state)
 
         coi = self._coi(bar_ms, symbol, 'ENTRY')
         op = {'kind': 'entry', 'phase': 'submit', 'symbol': symbol, 'bar_ms': bar_ms,

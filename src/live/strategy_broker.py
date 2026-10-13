@@ -33,12 +33,23 @@ class StrategyBroker:
         self.last_report={}
         self.entry_guard=None
         self.initial_allocated_equity=None
+        self._entry_state=None
+        self.entry_deadline_ms=None
 
     def close(self):
         self.ledger.close(); self.engine.close()
 
     def _write(self):
+        self._entry_state=None
         if not self.writes_enabled: raise RuntimeError('strategy writes disabled')
+
+    def offer_entry_state(self, state):
+        # Only the immediately preceding reconciled snapshot may be handed to
+        # the entry adapter. Never cache across orders, cycles or restarts.
+        self._entry_state=(self.clock(),state)
+
+    def clear_entry_state(self):
+        self._entry_state=None
 
     def _bindings(self):
         return {int(c):json.loads(v) for c,v in self.db.execute('SELECT coi,value FROM bindings ORDER BY rowid')}
@@ -71,10 +82,10 @@ class StrategyBroker:
             if market.rejects(float(half),tp_price) or market.rejects(float(q-half),tp_price):
                 raise ValueError('entry cannot support configured partial TP at exchange minimums')
         if hasattr(self.transport,'budget'):
-            from .request_budget import RequestDeferred
+            from .request_budget import RequestDeferred, EntryDeferred
             try: self.transport.budget.check(24)
-            except RequestDeferred:
-                raise ValueError('insufficient API headroom for entry and protection; entry skipped') from None
+            except RequestDeferred as exc:
+                raise EntryDeferred(exc) from None
 
     def _intent(self,market,side,qty,coi,*,closing,kind,price,trigger='0',tif='immediate-or-cancel'):
         if side not in ('LONG','SHORT'): raise ValueError('invalid position side')
@@ -86,11 +97,13 @@ class StrategyBroker:
             str(price_tick(number(trigger),market.price_decimals,upward=side=='LONG')))
 
     def market_order(self,market,symbol,position_side,qty,closing,coi,ref_price):
+        offered=self._entry_state
         self._write()
         if not closing and self.entry_guard is not None and not self.entry_guard():
             raise UnverifiedExecution('new entries paused')
         if self.engine.store.load(coi) is None:
-            state=self.account_state()
+            state=(offered[1] if not closing and offered is not None
+                   and 0<=self.clock()-offered[0]<=1 else self.account_state())
             if not state.execution_changes_verified:
                 raise UnverifiedExecution('entry/exit requires reconciled owned exposure')
             actual=state.positions.get(market.symbol)
@@ -102,10 +115,16 @@ class StrategyBroker:
                 raise UnverifiedExecution('old active orders must be resolved before re-entry')
             if not closing and hasattr(self.transport,'budget'):
                 self.transport.budget.check(20)  # leave room for entry reconciliation and protection
+        if not closing and self.entry_deadline_ms is not None and self.clock()*1000>=self.entry_deadline_ms:
+            raise UnverifiedExecution('entry deadline elapsed before submission; no order sent')
         self._bind(coi,symbol,position_side,'EXIT' if closing else 'ENTRY')
         existing=self.engine.store.load(coi)
         intent=existing[0] if existing else self._intent(market,position_side,qty,coi,closing=closing,kind='market',price=ref_price)
-        self.engine.create(intent,market.size_decimals,market.price_decimals)
+        self.transport.new_entry_deadline_ms=self.entry_deadline_ms if not closing else None
+        try:
+            self.engine.create(intent,market.size_decimals,market.price_decimals)
+        finally:
+            self.transport.new_entry_deadline_ms=None
         return self.market_order_result(coi)
 
     def market_order_result(self,coi):
@@ -150,6 +169,7 @@ class StrategyBroker:
         self._write(); self.engine.cancel(ref.client_order_index)
 
     def account_state(self):
+        self._entry_state=None
         self.engine.reconcile_amendments()
         active=self.transport.active_orders()
         active_by_coi={r['client_order_index']:r for r in active}

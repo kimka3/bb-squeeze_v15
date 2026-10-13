@@ -242,7 +242,7 @@ def test_transport_explicit_key_always_supplies_server_nonce():
     t=LighterTransport.__new__(LighterTransport)
     t.account_index=100; t.api_key_index=4; t.client=Signer()
     t.get=lambda path:{'nonce':42}
-    calls=[]; t._send=calls.append
+    calls=[]; t._send=lambda request, **kwargs:calls.append(request)
     t.submit(buy(),41,251250,0)
     t.cancel(0,1001)
     t.amend(0,1001,41,249000,250000)

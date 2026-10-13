@@ -177,11 +177,14 @@ class LighterTransport:
             raise RuntimeError('order lookup identity ambiguous')
         return rows[0] if rows else None
 
-    def _send(self, coro):
+    def _send(self, coro, *, deadline_ms=None):
         # An error or lost response is ambiguous. The execution engine must
         # reconcile the durable intent; it must never blindly resend it.
         try:
-            try: self.budget.check(consume=True)
+            try:
+                self.budget.check(consume=True)
+                if deadline_ms is not None and time.time()*1000>=deadline_ms:
+                    raise RuntimeError('entry deadline elapsed before transaction send')
             except Exception:
                 coro.close()
                 raise
@@ -199,13 +202,18 @@ class LighterTransport:
         times = {'immediate-or-cancel': c.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                  'post-only': c.ORDER_TIME_IN_FORCE_POST_ONLY,
                  'good-till-time': c.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME}
+        nonce=self._next_nonce()
+        deadline=getattr(self,'new_entry_deadline_ms',None)
+        if not intent.reduce_only and deadline is not None and time.time()*1000>=deadline:
+            raise RuntimeError('entry deadline elapsed; transaction not sent')
         self._send(c.create_order(market_index=intent.market_index,
             client_order_index=intent.client_order_index, base_amount=base_amount,
             price=price, trigger_price=trigger, is_ask=intent.is_ask,
             order_type=types[intent.order_type], time_in_force=times[intent.time_in_force],
-            reduce_only=intent.reduce_only, api_key_index=self.api_key_index, nonce=self._next_nonce(),
+            reduce_only=intent.reduce_only, api_key_index=self.api_key_index, nonce=nonce,
             order_expiry=c.DEFAULT_IOC_EXPIRY if intent.order_type == 'market'
-                         else c.DEFAULT_28_DAY_ORDER_EXPIRY))
+                         else c.DEFAULT_28_DAY_ORDER_EXPIRY),
+                   deadline_ms=deadline if not intent.reduce_only else None)
 
     def cancel(self, market_index, order_index):
         self._send(self.client.cancel_order(market_index=market_index,

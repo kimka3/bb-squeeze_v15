@@ -94,3 +94,40 @@ excluded from timing totals. Use a fresh output directory every run.
 Store account/session identifiers, balances and full API responses in private
 deployment evidence, not in this public repository. Run the full suite on the
 target Linux environment before accepting a staged revision.
+
+## Entry request headroom and bounded retries (2026-10-14)
+
+A reconciled account snapshot used for entry sizing is now handed once to the
+immediately following entry preflight. It expires after one second and is
+invalidated by another account read or any mutation. Each subsequent symbol
+still obtains fresh equity. A single-page reconciliation saves four duplicate
+REST reads per new entry; pagination changes the number of reads saved.
+The 55 requests / 60.1 seconds limiter, 24-slot validation and 20-slot submission
+checks are unchanged. Capacity is checked, not atomically reserved; external
+clients and SDK bootstrap remain outside the measured counter.
+
+Only a pre-intent headroom rejection creates an in-memory deferred candidate.
+Candidates and remaining symbols keep canonical order and the original signal
+bar. The runner checks the queue without waiting inside risk service. Requests
+are not sent until the limiter-provided retry time. Before retry it requires
+33 slots (nine planned refresh/sizing reads plus the existing 24-slot guard),
+refreshes marks, services protection, reconciles the account and re-evaluates
+basis, margin, current equity, sizing, pauses and unresolved operations.
+No signal scan, position ageing or completed-bar trailing is replayed.
+
+The fixed cutoff remains signal-bar close plus bar_grace_seconds (60 seconds in
+production). The deadline is checked after fresh reads and immediately before
+local transaction dispatch, including after nonce lookup and budget acquisition.
+Exchange receipt/processing can be later than local dispatch. Reduce-only
+protection and exits are not stopped by the entry deadline. A post-intent unknown
+outcome remains subject to the existing durable recovery/HALT behavior; it is
+never converted into a new candidate or blindly resent.
+
+Expired candidates, candidates blocked by operational controls and unsubmitted
+candidates at process restart are discarded. There is no late catch-up trade.
+Deferral records now include used/required/limit, cooldown and retry/deadline
+timestamps. Runner status exposes the pending candidate list without embedding
+market frames. Synthetic tests cover quota metering, multiple candidates,
+expiry, pause, stale state, missing ownership, current equity, restart and
+protection-before-retry scheduling. They do not prove every future signal can
+execute within the unchanged entry window.

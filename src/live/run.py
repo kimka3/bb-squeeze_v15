@@ -386,6 +386,8 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         'pending_operation': getattr(trader, 'pending_operation', None),
         'residual_exits': getattr(trader, 'residual_exits', {}),
         'data_gaps': list(getattr(trader, 'data_gaps', [])),
+        'deferred_entries': ({k:v for k,v in trader.deferred_entries.items() if k!='rows'}
+                             if getattr(trader, 'deferred_entries', None) else None),
         'runtime_coverage': runtime_coverage,
         **health})
 
@@ -475,6 +477,17 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                     trader.journal.append('service_error', error=str(exc))
                     coverage.failure('service', int(time.time() * 1000), str(exc))
                 next_poll_at = time.time() + config.poll_seconds
+                persist_report(trader, config, coverage=coverage, **counters)
+            if (isinstance(trader.broker, StrategyBroker)
+                    and getattr(trader, 'deferred_entries', None)
+                    and not STOP_REQUESTED.is_set() and time.time() < deadline):
+                try:
+                    trader.retry_deferred_entries()
+                except Exception as exc:
+                    # An unknown read/order outcome is never a retryable new
+                    # candidate. Existing protection/recovery continues below.
+                    trader.deferred_entries = None
+                    trader._halt(f'deferred entry reconciliation failed: {exc}')
                 persist_report(trader, config, coverage=coverage, **counters)
             now = time.time()
             if now >= deadline or STOP_REQUESTED.is_set():
