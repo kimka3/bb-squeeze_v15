@@ -385,6 +385,9 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         'halt_reasons': list(getattr(trader, 'halt_reasons', [])),
         'pending_operation': getattr(trader, 'pending_operation', None),
         'residual_exits': getattr(trader, 'residual_exits', {}),
+        'orphan_orders': getattr(trader, 'orphan_orders', {}),
+        'api_read_diagnostics_error': getattr(getattr(trader.broker, 'transport', None),
+                                              'read_diagnostics_error', None),
         'data_gaps': list(getattr(trader, 'data_gaps', [])),
         'deferred_entries': ({k:v for k,v in trader.deferred_entries.items() if k!='rows'}
                              if getattr(trader, 'deferred_entries', None) else None),

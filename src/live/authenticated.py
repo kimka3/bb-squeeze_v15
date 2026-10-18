@@ -16,10 +16,14 @@ import stat
 import sys
 import time
 import hashlib
+import http.client
+import math
+import re
 from collections import deque
 import urllib.error
 import urllib.request
-from .request_budget import RequestBudget
+from .request_budget import RequestBudget, RequestDeferred
+from .read_diagnostics import ReadDiagnostics, sanitize_sample
 
 HOSTS = {'mainnet': 'https://mainnet.zklighter.elliot.ai',
          'testnet': 'https://testnet.zklighter.elliot.ai'}
@@ -86,6 +90,9 @@ class LighterTransport:
         scope = hashlib.sha256((network + self.expected_address).encode()).hexdigest()[:24]
         self.budget = RequestBudget(Path(key_file).parent / ('requests-' + scope + '.sqlite'))
         self.request_samples = deque(maxlen=1000)
+        self.read_diagnostics = ReadDiagnostics(Path(key_file).parent / ('api-reads-' + scope + '.jsonl'))
+        self.read_diagnostics_error = None
+        self._last_read_retry = float('-inf')
         self.loop = asyncio.new_event_loop()
         self.client = None
         self.opener = urllib.request.build_opener(NoRedirect())
@@ -116,39 +123,112 @@ class LighterTransport:
             self.budget.close()
             self.budget = None
 
-    def get(self, path, *, private=True):
-        if not path.startswith('/api/v1/') or any(c in path for c in ('\r', '\n', '#')):
-            raise ValueError('invalid API path')
-        self.budget.check(consume=True)
-        started = time.monotonic()
-        status = 'error'
-        headers = {}
-        if private:
-            with quiet_native():
-                auth, err = self.client.create_auth_token_with_expiry(
-                    deadline=120, api_key_index=self.api_key_index)
-            if err or not auth:
-                raise RuntimeError('authentication token generation failed')
-            headers['Authorization'] = auth
+    def _record_read(self, sample):
+        sample = sanitize_sample(sample)
+        self.request_samples.append(sample)
+        diagnostics = getattr(self, 'read_diagnostics', None)
+        if diagnostics is not None:
+            try:
+                diagnostics.record(sample)
+            except Exception as exc:
+                # Loss of observability blocks NEW entries through the health
+                # guard, but must not prevent existing position protection.
+                self.read_diagnostics_error = type(exc).__name__
+                # Latched for this process: a later successful write cannot
+                # restore the missing evidence. Operator inspection/restart
+                # is required; never silently erase it within one poll.
+
+    def _read_retry_reason(self, endpoint, started, attempt, transient, retry_after):
+        if (not transient or retry_after is not None or endpoint == '/api/v1/nextNonce'
+                or getattr(self, 'new_entry_deadline_ms', None) is not None):
+            return 'not_retryable'
+        if attempt >= 2 or time.monotonic() - getattr(self, '_last_read_retry', float('-inf')) < 60.1:
+            return 'retry_limit'
+        if time.monotonic() - started >= 9:
+            return 'deadline'
         try:
-            with self.opener.open(urllib.request.Request(self.host + path, headers=headers), timeout=10) as r:
-                data = json.load(r)
-                status = r.status
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            if exc.code in (405, 429):
-                try: delay = float(exc.headers.get('Retry-After', 60))
-                except (TypeError, ValueError): delay = 60
-                self.budget.defer(delay)
-            raise RuntimeError(f'API read failed (HTTP {exc.code}); response suppressed') from None
-        except Exception as exc:
-            raise RuntimeError(f'API read failed ({type(exc).__name__}); response suppressed') from None
-        finally:
-            self.request_samples.append({'endpoint': path.split('?')[0], 'status': status,
-                                         'seconds': time.monotonic()-started})
-        if not isinstance(data, dict) or data.get('code') != 200:
-            raise RuntimeError('API returned a non-success payload')
-        return data
+            self.budget.check(21)  # one extra read, keep 20 slots for protection
+        except RequestDeferred:
+            return 'budget_deferred'
+        return None
+
+    def get(self, path, *, private=True):
+        endpoint = path.split('?')[0]
+        if not re.fullmatch(r'/api/v1/[A-Za-z0-9_]+', endpoint) or any(c in path for c in ('\r', '\n', '#')):
+            raise ValueError('invalid API path')
+        started = time.monotonic()
+        for attempt in (1, 2):
+            # Never retry a transaction. Only quick, transient GET failures may
+            # use one additional read, at most once per 60.1s per transport.
+            self.budget.check(consume=True)
+            headers = {}
+            if private:
+                auth_error = None
+                try:
+                    with quiet_native():
+                        auth, err = self.client.create_auth_token_with_expiry(
+                            deadline=120, api_key_index=self.api_key_index)
+                    if err or not auth: auth_error = 'AuthenticationError'
+                except Exception as exc:
+                    auth_error = type(exc).__name__
+                if auth_error:
+                    self._record_read({'timestamp_ms':int(time.time()*1000), 'endpoint':endpoint,
+                        'status':'error', 'seconds':time.monotonic()-started, 'attempt':attempt,
+                        'outcome':'auth_error', 'error_type':auth_error})
+                    raise RuntimeError('authentication token generation failed; details suppressed') from None
+                headers['Authorization'] = auth
+            sample = {'timestamp_ms':int(time.time()*1000), 'endpoint':endpoint,
+                      'status':'error', 'attempt':attempt, 'request_ids':{}}
+            retry_after = None
+            transient = False
+            attempt_started = time.monotonic()
+            try:
+                remaining = 10 - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise TimeoutError('read deadline elapsed')
+                with self.opener.open(urllib.request.Request(self.host + path, headers=headers), timeout=remaining) as r:
+                    sample['status'] = r.status
+                    response_headers = getattr(r, 'headers', {})
+                    sample['request_ids'] = {k:response_headers.get(k) for k in (
+                        'x-request-id','x-correlation-id','x-amz-cf-id','x-amzn-requestid','cf-ray')}
+                    data = json.load(r)
+                # urllib timeout is a socket timeout, not a hard wall-clock
+                # cancellation. Never use a payload that returns too late.
+                if time.monotonic() - started >= 10:
+                    raise TimeoutError('read deadline elapsed')
+                if not isinstance(data, dict) or data.get('code') != 200:
+                    sample['outcome'] = 'payload_error'
+                    raise ValueError('non-success payload')
+            except urllib.error.HTTPError as exc:
+                sample.update(status=exc.code, outcome='http_error', error_type='HTTPError')
+                response_headers = exc.headers or {}
+                sample['request_ids'] = {k:response_headers.get(k) for k in (
+                    'x-request-id','x-correlation-id','x-amz-cf-id','x-amzn-requestid','cf-ray')}
+                retry_after = response_headers.get('Retry-After')
+                if exc.code in (405, 429):
+                    try: delay = float(retry_after or 60)
+                    except (TypeError, ValueError): delay = 60
+                    if not math.isfinite(delay) or delay < 0: delay = 60
+                    self.budget.defer(delay)
+                transient = exc.code in (502, 503, 504)
+                exc.close()
+            except Exception as exc:
+                sample.update(error_type=type(exc).__name__)
+                sample.setdefault('outcome', 'transport_error')
+                transient = isinstance(exc, (http.client.RemoteDisconnected, ConnectionResetError))
+            else:
+                sample.update(outcome='success', seconds=time.monotonic()-attempt_started)
+                self._record_read(sample)
+                return data
+            reason = self._read_retry_reason(endpoint, started, attempt, transient, retry_after)
+            sample.update(seconds=time.monotonic()-attempt_started,
+                          retry_reason=reason or ('transient_http' if sample['outcome']=='http_error' else 'transport_error'))
+            self._record_read(sample)
+            if reason is None:
+                self._last_read_retry = time.monotonic()
+                continue
+            kind = f"HTTP {sample['status']}" if sample['outcome']=='http_error' else sample['error_type']
+            raise RuntimeError(f'API read failed ({kind}) endpoint={endpoint} attempt={attempt} retry={reason}; response suppressed') from None
 
     def account(self):
         data = self.get(f'/api/v1/account?by=index&value={self.account_index}')
@@ -203,6 +283,8 @@ class LighterTransport:
                  'post-only': c.ORDER_TIME_IN_FORCE_POST_ONLY,
                  'good-till-time': c.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME}
         nonce=self._next_nonce()
+        if not intent.reduce_only and getattr(self, 'read_diagnostics_error', None):
+            raise RuntimeError('API diagnostic evidence lost; new entry refused')
         deadline=getattr(self,'new_entry_deadline_ms',None)
         if not intent.reduce_only and deadline is not None and time.time()*1000>=deadline:
             raise RuntimeError('entry deadline elapsed; transaction not sent')

@@ -83,6 +83,43 @@ The 180-second staleness threshold is an operational setting, not an observed
 worst-case response bound. Alerts are local; no email, messenger or phone push
 has been configured.
 
+Health also checks fresh market polls, orphan orders and API diagnostic storage.
+Malformed/future timestamps fail closed. Resume checks current collection gaps
+and rereads the actual service status after the user's confirmation. Historical
+recovered gaps do not block resume. `entry_pause_reason` identifies a latched
+operator or monitor pause even after API reads recover.
+
+## API interruptions and diagnostics
+
+Quick HTTP 502/503/504 or direct connection-close/reset failures may get one
+additional GET attempt. At most one extra attempt per transport per 60.1 seconds
+is allowed; every attempt consumes the shared 55-request budget, and the extra
+attempt requires 21 available slots to leave 20 for protection. No sleeps are
+introduced inside risk service. Retry-After responses, rate limits, timeouts,
+authentication/payload errors, nextNonce and an active entry-send deadline do
+not use this retry. Transactions are never blindly resent. The existing entry
+deadline and 24/20-slot entry checks remain in place.
+
+Retries must start with at least one second of the original ten-second read
+budget remaining. The socket timeout uses the remaining budget and a response
+arriving after it is discarded. urllib does not provide hard wall-clock
+cancellation of every socket operation; this is not a hard real-time guarantee.
+
+`api-reads-<wallet-scope>.jsonl` beside the protected API key stores allowlisted
+endpoint, timestamp, status, duration, attempt, failure class and response request
+IDs. Query strings, auth headers, response bodies and exception messages are
+excluded. Files are 0600 on Linux and rotate at 2 MiB with two backups. A storage
+failure latches diagnostic loss for the process lifetime, blocks new entries
+immediately, and appears in health; existing reduce-only protection remains
+available. Repair storage and inspect the evidence before a human-operated
+restart/resume. A later successful log write does not restore missing evidence.
+
+An exchange maintenance window can disable API and transaction processing.
+Retries cannot make such an exchange available or guarantee a native stop will
+execute while matching is unavailable. Check the official status/announcement
+channels for planned windows. Keep the safety pause on prolonged interruption;
+do not extend stale prices, entry deadlines or health thresholds to hide it.
+
 Install units from `scripts/*.service.in` with explicit reviewed paths. Verify
 with systemd-analyze before use. Services/timers stay disabled and inactive after
 installation. A separate transient read-only probe can validate service

@@ -93,19 +93,58 @@ def activation(path,fingerprint,account):
     return data
 
 
-def health(live,*,active=True,now_ms=None):
-    now_ms=int(time.time()*1000) if now_ms is None else now_ms
+def health(live,*,active=True,now_ms=None,for_resume=False):
     path=live.state_dir/'runner_status.json'; issues=[]
-    state=json.loads(path.read_text()) if path.exists() else {}
+    try:
+        state=json.loads(path.read_text())
+        if not isinstance(state,dict):raise ValueError('status must be an object')
+    except (OSError,UnicodeError,ValueError):
+        state={};issues.append('runner status unavailable or malformed')
+    # Capture time after the atomic status read: an update racing the read must
+    # not look like a timestamp from the future merely because we sampled first.
+    now_ms=int(time.time()*1000) if now_ms is None else now_ms
+    def recent(key,label,stale_message):
+        stamp=state.get(key)
+        if type(stamp) is not int or stamp<=0:
+            issues.append(label+' timestamp missing or invalid')
+        elif stamp>now_ms:
+            issues.append(label+' timestamp is in the future')
+        elif now_ms-stamp>180000:
+            issues.append(stale_message)
     if not active:issues.append('strategy service is not active')
-    if now_ms-state.get('updated_ms',0)>180000:issues.append('runner heartbeat stale')
-    if now_ms-(state.get('last_successful_service_ms') or 0)>180000:issues.append('protection service has no recent successful reconciliation')
-    if state.get('halted'):issues.append('persistent strategy HALT: '+'; '.join(state.get('halt_reasons',[])))
+    recent('updated_ms','runner heartbeat','runner heartbeat stale')
+    recent('last_successful_service_ms','protection service','protection service has no recent successful reconciliation')
+    recent('last_successful_poll_ms','market poll','market poll has no recent successful read')
+    if state.get('halted'):
+        reasons=state.get('halt_reasons',[])
+        detail='; '.join(reasons) if isinstance(reasons,list) and all(isinstance(r,str) for r in reasons) else 'reason unavailable'
+        issues.append('persistent strategy HALT: '+detail)
     if state.get('pending_operation'):issues.append('unresolved order operation')
     if state.get('residual_exits'):issues.append('residual position requires close reconciliation')
+    if state.get('orphan_orders'):issues.append('orphan orders require reconciliation')
     if state.get('data_gaps'):issues.append('signal data gap unresolved')
+    if state.get('api_read_diagnostics_error'):issues.append('API read diagnostics could not be persisted')
+    # Existing deployments may not yet emit the optional coverage/diagnostic
+    # fields. Historical failures do not prohibit recovery. A human resume,
+    # however, must not clear the latch before a current failed stream recovers.
+    coverage=state.get('runtime_coverage')
+    if coverage is not None and not isinstance(coverage,dict):
+        issues.append('runtime coverage malformed')
+    elif for_resume and coverage is not None:
+        gaps=coverage.get('active_gap_streams',[])
+        if not isinstance(gaps,list):issues.append('runtime active gap status malformed')
+        elif gaps:issues.append('runtime data collection has an active failure')
+    paused=(live.state_dir/'ENTRY_PAUSED').exists()
+    pause_reason=None
+    if paused:
+        try:
+            pause=json.loads((live.state_dir/'ENTRY_PAUSED').read_text())
+            reason=pause.get('reason') if isinstance(pause,dict) else None
+            pause_reason=(reason if reason in ('operator pause','operational monitor','operator stop requested')
+                          else 'unrecognized pause marker')
+        except (OSError,UnicodeError,ValueError):pause_reason='unreadable pause marker'
     return {'checked_at_ms':now_ms,'healthy':not issues,'issues':issues,
-            'entries_paused':(live.state_dir/'ENTRY_PAUSED').exists(),
+            'entries_paused':paused,'entry_pause_reason':pause_reason,
             'last_successful_service_ms':state.get('last_successful_service_ms'),
             'alert_delivery':'local attention.json and system journal; no external notifications'}
 
@@ -121,7 +160,8 @@ def run_service(cfg,live,fingerprint):
             trader,markets=runner.build_authenticated_strategy(live,t,start_ms=approval['started_at_ms'],
                 writes_enabled=True,account_lock_path=cfg['account_lock_path'])
             trader.broker.initial_allocated_equity=approval['initial_equity']
-            trader.broker.entry_guard=lambda:not (live.state_dir/'ENTRY_PAUSED').exists()
+            trader.broker.entry_guard=lambda:(not (live.state_dir/'ENTRY_PAUSED').exists()
+                                              and not getattr(t,'read_diagnostics_error',None))
             # No on_bar/entry until first account reconciliation and recovery.
             trader.broker.poll(); trader.service()
             trader.journal.append('production_start',fingerprint=fingerprint,
@@ -200,12 +240,13 @@ def main():
         if not sys.stdin.isatty():raise RuntimeError('resume requires a human interactive terminal')
         activation(live.state_dir/'activation.json',fingerprint,live.account_index)
         active=subprocess.run(['systemctl','is-active','--quiet',UNIT]).returncode==0
-        state=health(live,active=active)
+        state=health(live,active=active,for_resume=True)
         if not state['healthy']:raise RuntimeError('cannot resume: '+ '; '.join(state['issues']))
         text=f'RESUME LIVE {live.account_index}'
         if input('Type '+text+': ').strip()!=text:raise RuntimeError('entries remain paused')
         # Recheck after potentially delayed input; never clear a safety HALT.
-        if not health(live,active=True)['healthy']:raise RuntimeError('health changed; entries remain paused')
+        active=subprocess.run(['systemctl','is-active','--quiet',UNIT]).returncode==0
+        if not health(live,active=active,for_resume=True)['healthy']:raise RuntimeError('health changed; entries remain paused')
         (live.state_dir/'ENTRY_PAUSED').unlink(missing_ok=True)
         print('Operator pause cleared. Existing strategy HALT is never reset.');return
     if args.command=='start':
