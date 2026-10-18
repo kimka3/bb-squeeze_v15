@@ -108,7 +108,10 @@ cancellation of every socket operation; this is not a hard real-time guarantee.
 `api-reads-<wallet-scope>.jsonl` beside the protected API key stores allowlisted
 endpoint, timestamp, status, duration, attempt, failure class and response request
 IDs. Query strings, auth headers, response bodies and exception messages are
-excluded. Files are 0600 on Linux and rotate at 2 MiB with two backups. A storage
+excluded. Files are 0600 on Linux and rotate at 2 MiB with two backups. A separate
+nonblocking process lock serializes append/rotation across administrative and
+service transports; lock contention is reported as diagnostic unavailability.
+A storage
 failure latches diagnostic loss for the process lifetime, blocks new entries
 immediately, and appears in health; existing reduce-only protection remains
 available. Repair storage and inspect the evidence before a human-operated

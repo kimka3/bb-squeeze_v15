@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -53,7 +54,8 @@ def test_rotation_retains_two_bounded_backups_and_complete_records(tmp_path, mon
         writer.record({'timestamp_ms': number, 'endpoint': '/api/v1/account',
                        'status': 200, 'outcome': 'success'})
     paths = [path, *writer.backups]
-    assert set(tmp_path.iterdir()) == set(paths)
+    assert set(tmp_path.iterdir()) == {*paths, writer.lock_path}
+    assert writer.lock_path.read_bytes() == b'\0'
     for candidate in paths:
         assert 0 < candidate.stat().st_size <= 128
         for line in candidate.read_text().splitlines():
@@ -63,7 +65,7 @@ def test_rotation_retains_two_bounded_backups_and_complete_records(tmp_path, mon
     assert json.loads(writer.backups[1].read_text())['timestamp_ms'] == 27
 
 
-@pytest.mark.parametrize('suffix', ['', '.1', '.2'])
+@pytest.mark.parametrize('suffix', ['', '.1', '.2', '.lock'])
 def test_refuses_symlink_at_log_or_rotation_target(tmp_path, suffix):
     sentinel = tmp_path / 'sentinel'
     sentinel.write_text('do not change')
@@ -106,17 +108,66 @@ def test_extreme_numeric_metadata_is_omitted(tmp_path):
     assert json.loads(path.read_text()) == {}
 
 
-def test_hardlinked_target_refused_without_changing_other_file(tmp_path):
+@pytest.mark.parametrize('suffix', ['', '.lock'])
+def test_hardlinked_target_refused_without_changing_other_file(tmp_path, suffix):
     sentinel = tmp_path / 'sentinel'
     sentinel.write_text('do not change')
     path = tmp_path / 'reads.jsonl'
     try:
-        os.link(sentinel, path)
+        os.link(sentinel, path.with_name(path.name + suffix))
     except OSError:
         pytest.skip('hardlink creation unavailable')
     with pytest.raises(OSError):
         ReadDiagnostics(path).record({'status': 200})
     assert sentinel.read_text() == 'do not change'
+
+
+def test_process_contention_never_writes_or_rotates_until_lock_released(tmp_path, monkeypatch):
+    path = tmp_path / 'reads.jsonl'
+    writer = ReadDiagnostics(path)
+    monkeypatch.setattr(ReadDiagnostics, 'MAX_BYTES', 128)
+    writer.record({'timestamp_ms': 1, 'endpoint': '/api/v1/account', 'outcome': 'success'})
+    before = path.read_bytes()
+    script = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+from live.read_diagnostics import ReadDiagnostics
+ReadDiagnostics.MAX_BYTES = 128
+writer = ReadDiagnostics(sys.argv[2])
+try:
+    writer.record({'timestamp_ms': 2, 'endpoint': '/api/v1/account', 'outcome': 'success'})
+except OSError:
+    if sys.argv[3] != 'blocked': raise
+    print('blocked')
+else:
+    if sys.argv[3] != 'write': raise AssertionError('contending writer acquired the lock')
+    print('written')
+'''
+    command = [sys.executable, '-c', script, str(Path(__file__).parents[1] / 'src'), str(path)]
+    with writer._lock():
+        result = subprocess.run([*command, 'blocked'], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == 'blocked'
+        assert path.read_bytes() == before
+        assert not any(p.exists() for p in writer.backups)
+    result = subprocess.run([*command, 'write'], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'written'
+    assert json.loads(path.read_text())['timestamp_ms'] == 2
+    assert writer.backups[0].read_bytes() == before
+    assert writer.lock_path.read_bytes() == b'\0'
+    if os.name == 'posix':
+        assert stat.S_IMODE(writer.lock_path.stat().st_mode) == 0o600
+
+
+def test_existing_oversize_lock_is_refused_before_log_write(tmp_path):
+    path = tmp_path / 'reads.jsonl'
+    writer = ReadDiagnostics(path)
+    writer.lock_path.write_bytes(b'unchanged')
+    with pytest.raises(OSError):
+        writer.record({'status': 200})
+    assert writer.lock_path.read_bytes() == b'unchanged'
+    assert not path.exists()
 
 
 def test_io_failures_propagate_and_existing_oversize_log_is_not_destroyed(tmp_path, monkeypatch):
