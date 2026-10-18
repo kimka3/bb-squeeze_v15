@@ -17,6 +17,7 @@ import pandas as pd
 
 import bb_squeeze_combined_v6e_dynamic as frozen
 from data_io import H4, LONGS
+from .authenticated import APIReadError, _network_read_failure_code
 
 # USD-M futures klines from the documented endpoint. Access eligibility must
 # be checked from the actual VPS; endpoint denial is a readiness failure.
@@ -30,6 +31,21 @@ WARMUP_BARS = 600
 CLOSED_WARMUP_BARS = WARMUP_BARS - 1
 
 
+def _read_failure(exc, endpoint):
+    """Retain trusted read-failure classification, never infer it from text."""
+    if isinstance(exc, urllib.error.HTTPError):
+        status = exc.code
+        temporary = status in (429, 502, 503, 504)
+        return APIReadError(f'Binance public read failed (HTTP {status}); response suppressed',
+            code='temporary_http' if temporary else 'nontransient_http',
+            endpoint=endpoint, http_status=status, automatic_recovery_allowed=temporary)
+    code = _network_read_failure_code(exc)
+    if code is not None:
+        return APIReadError('Binance public network read failed; details suppressed',
+            code=code, endpoint=endpoint, automatic_recovery_allowed=True)
+    return None
+
+
 def _klines_raw(symbol: str, interval: str, limit: int,
                 timeout: int, retries: int, hosts=None,
                 end_time_ms: int | None = None) -> list:
@@ -37,8 +53,10 @@ def _klines_raw(symbol: str, interval: str, limit: int,
 
     The two failures are different and must not be conflated. A 451/403 is this
     location being restricted: the host will keep refusing, so retrying it wastes
-    the whole backoff budget before the working host is ever tried. Anything else
-    is a flake and deserves the backoff on the same host.
+    the whole backoff budget before the working host is ever tried. Only typed
+    temporary HTTP/network errors permit automatic recovery after later checks.
+    Generic OSError retains its old bounded read retry but is not promoted to
+    automatic recovery. Invalid payloads and other errors stay nontransient.
     """
     last = None
     for host in (hosts or BINANCE_HOSTS):
@@ -54,17 +72,29 @@ def _klines_raw(symbol: str, interval: str, limit: int,
                     raise ValueError('expected non-empty kline array')
                 return payload
             except urllib.error.HTTPError as exc:
-                last = exc
                 if exc.code in (451, 403):
                     raise RuntimeError(f'{symbol}: documented Binance endpoint denied '
                                        f'access ({exc.code}); use an eligible host location') from exc
+                last = _read_failure(exc, '/fapi/v1/klines')
+                if not last.automatic_recovery_allowed:
+                    raise last from None
                 if attempt + 1 < retries:
                     time.sleep(2 ** attempt)
-            except Exception as exc:          # network flake, not a data problem
-                last = exc
+            except Exception as exc:
+                last = _read_failure(exc, '/fapi/v1/klines')
+                if last is None:
+                    if type(exc) is OSError:
+                        # Compatibility with the existing read-only retry. Its
+                        # text is never evidence of an automatically recoverable
+                        # transport failure if all attempts still fail.
+                        last = exc
+                    else:
+                        raise  # TLS, JSON/schema and local I/O are not outage evidence.
                 if attempt + 1 < retries:
                     time.sleep(2 ** attempt)
-    raise RuntimeError(f'{symbol}: Binance klines unavailable: {last}')
+    if last is not None:
+        raise last from None
+    raise RuntimeError(f'{symbol}: Binance klines unavailable; no request attempted')
 
 
 def fetch_klines(symbol: str, limit: int = WARMUP_BARS, interval: str = '4h',
@@ -144,13 +174,24 @@ def prepare(symbols: list[str], *, base_url=None, timeout=10, retries=2,
         last = int(d.time.iloc[-1]) if len(d) else None
         if (len(d) != CLOSED_WARMUP_BARS or first != expected_first
                 or last != expected_last):
-            raise RuntimeError(f'{s}: closed-bar window mismatch; '
+            detail = (f'{s}: closed-bar window mismatch; '
                                f'closed_before_ms={cutoff}, end_time_ms={cutoff - 1}, '
                                f'expected_count={CLOSED_WARMUP_BARS}, '
                                f'expected_first_ms={expected_first}, '
                                f'expected_last_ms={expected_last}, '
                                f'observed_count={len(d)}, observed_first_ms={first}, '
                                f'observed_last_ms={last}')
+            # fetch_klines already verified OHLC and full internal continuity.
+            # The endpoint may publish the just-closed final bar slightly late:
+            # distinguish only one missing newest bar from arbitrary truncation.
+            # Still reject the frame; a later complete read is required.
+            newest_pending = (last == expected_last-H4 and
+                ((len(d) == CLOSED_WARMUP_BARS and first == expected_first-H4) or
+                 (len(d) == CLOSED_WARMUP_BARS-1 and first == expected_first)))
+            if newest_pending:
+                raise APIReadError(detail, code='feed_not_ready', endpoint='/fapi/v1/klines',
+                                   automatic_recovery_allowed=True)
+            raise RuntimeError(detail)
     out = {}
     for s in symbols:
         d = loaded[s]
@@ -173,8 +214,14 @@ def prepare(symbols: list[str], *, base_url=None, timeout=10, retries=2,
 def clock_skew_seconds(base_url: str, timeout: int = 10) -> float:
     """Compare public server UTC with local request midpoint; no credentials."""
     before = time.time()
-    with urllib.request.urlopen(f'{base_url}/fapi/v1/time', timeout=timeout) as response:
-        server = float(json.loads(response.read())['serverTime']) / 1000
+    try:
+        with urllib.request.urlopen(f'{base_url}/fapi/v1/time', timeout=timeout) as response:
+            server = float(json.loads(response.read())['serverTime']) / 1000
+    except Exception as exc:
+        classified = _read_failure(exc, '/fapi/v1/time')
+        if classified is not None:
+            raise classified from None
+        raise
     after = time.time()
     if not math.isfinite(server):
         raise RuntimeError('invalid Binance server time')

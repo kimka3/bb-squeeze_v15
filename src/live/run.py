@@ -388,6 +388,8 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         'orphan_orders': getattr(trader, 'orphan_orders', {}),
         'api_read_diagnostics_error': getattr(getattr(trader.broker, 'transport', None),
                                               'read_diagnostics_error', None),
+        'automatic_recovery': (trader.exchange_recovery.snapshot()
+                               if getattr(trader,'exchange_recovery',None) else None),
         'data_gaps': list(getattr(trader, 'data_gaps', [])),
         'deferred_entries': ({k:v for k,v in trader.deferred_entries.items() if k!='rows'}
                              if getattr(trader, 'deferred_entries', None) else None),
@@ -441,6 +443,8 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                     consecutive_bar_errors = 0
                     counters['next_bar_retry_ms'] = None
                 except Exception as exc:
+                    if getattr(trader,'exchange_recovery',None):
+                        trader.exchange_recovery.failure(exc,'bar')
                     counters['bar_errors'] += 1
                     counters['last_error'] = f'bar: {exc}'
                     trader.journal.append('bar_error', error=str(exc))
@@ -464,22 +468,31 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                     coverage.success('poll', counters['last_successful_poll_ms'])
                 except Exception as exc:
                     poll_failed = True
+                    if getattr(trader,'exchange_recovery',None):
+                        trader.exchange_recovery.failure(exc,'poll')
                     counters['poll_errors'] += 1
                     counters['last_error'] = f'poll: {exc}'
                     trader.journal.append('poll_error', error=str(exc))
                     coverage.failure('poll', int(time.time() * 1000), str(exc))
                 # Earlier fills can be persisted before a later poll request
                 # fails. Reconcile them without stale-price close retries.
+                service_failed = False
                 try:
                     trader.service(marks={} if poll_failed else None)
                     counters['last_successful_service_ms'] = int(time.time() * 1000)
                     coverage.success('service', int(time.time() * 1000))
                 except Exception as exc:
+                    service_failed = True
+                    if getattr(trader,'exchange_recovery',None):
+                        trader.exchange_recovery.failure(exc,'service')
                     counters['service_errors'] += 1
                     counters['last_error'] = f'service: {exc}'
                     trader.journal.append('service_error', error=str(exc))
                     coverage.failure('service', int(time.time() * 1000), str(exc))
                 next_poll_at = time.time() + config.poll_seconds
+                if getattr(trader,'exchange_recovery',None):
+                    trader.exchange_recovery.cycle(trader,coverage,poll_ok=not poll_failed,
+                        service_ok=not service_failed,now_ms=int(time.time()*1000))
                 persist_report(trader, config, coverage=coverage, **counters)
             if (isinstance(trader.broker, StrategyBroker)
                     and getattr(trader, 'deferred_entries', None)

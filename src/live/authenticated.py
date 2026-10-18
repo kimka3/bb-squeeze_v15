@@ -19,6 +19,8 @@ import hashlib
 import http.client
 import math
 import re
+import socket
+import ssl
 from collections import deque
 import urllib.error
 import urllib.request
@@ -28,6 +30,58 @@ from .read_diagnostics import ReadDiagnostics, sanitize_sample
 HOSTS = {'mainnet': 'https://mainnet.zklighter.elliot.ai',
          'testnet': 'https://testnet.zklighter.elliot.ai'}
 SDK_VERSION = '1.1.6'
+
+
+class APIReadError(RuntimeError):
+    """A transport-owned GET failure, with no response or credential material.
+
+    Automatic recovery classification is deliberately separate from the much
+    narrower immediate retry policy. In particular, a timeout may be checked
+    again by the operational controller but never gains an extra GET here.
+    """
+    def __init__(self, message, *, code, endpoint, automatic_recovery_allowed,
+                 http_status=None):
+        super().__init__(message)
+        self.code = code
+        self.endpoint = endpoint
+        self.http_status = http_status
+        self.automatic_recovery_allowed = bool(automatic_recovery_allowed)
+
+
+def is_transient_read_error(exc):
+    """Do not infer recoverability from exception text or unrelated errors."""
+    return type(exc) is APIReadError and exc.automatic_recovery_allowed is True
+
+
+def _network_read_failure_code(exc):
+    """Whitelist network failures; never promote TLS/auth/local I/O failures.
+
+    urllib can wrap a socket exception in URLError.reason. Only that typed
+    wrapper is traversed, with a depth/cycle bound; strings and generic OSError
+    are intentionally unknown. HTTPError must be handled by the HTTP branch.
+    """
+    seen = set()
+    for _ in range(8):
+        if id(exc) in seen or isinstance(exc, (ssl.SSLError, urllib.error.HTTPError)):
+            return None
+        seen.add(id(exc))
+        if isinstance(exc, urllib.error.URLError):
+            exc = exc.reason
+            continue
+        if isinstance(exc, http.client.RemoteDisconnected):
+            return 'remote_disconnected'
+        if isinstance(exc, TimeoutError):
+            return 'read_timeout'
+        if isinstance(exc, ConnectionResetError):
+            return 'connection_reset'
+        if isinstance(exc, ConnectionAbortedError):
+            return 'connection_aborted'
+        if isinstance(exc, socket.gaierror):
+            return 'dns_error'
+        if isinstance(exc, ConnectionRefusedError):
+            return 'connection_refused'
+        return None
+    return None
 
 
 @contextlib.contextmanager
@@ -108,8 +162,21 @@ class LighterTransport:
             with quiet_native():
                 self.loop.run_until_complete(connect())
             self.account()  # Bind the signer to the explicitly expected wallet.
-        except Exception:
-            self.close()
+        except Exception as exc:
+            diagnostics_failed = self.read_diagnostics_error is not None
+            try:
+                self.close()
+            except Exception:
+                # Cleanup diagnostics must not expose signer/key material or
+                # obscure the sanitized transport failure used for recovery.
+                pass
+            if diagnostics_failed or self.read_diagnostics_error is not None:
+                # A newly constructed transport would otherwise forget this
+                # latch after a temporary bootstrap failure and auto-recover
+                # without the lost evidence ever receiving inspection.
+                raise RuntimeError('API read diagnostic evidence lost during connection; manual inspection required; details suppressed') from None
+            if is_transient_read_error(exc) or isinstance(exc, RequestDeferred):
+                raise exc from None
             raise RuntimeError('authenticated connection failed; secrets suppressed') from None
 
     def close(self):
@@ -181,6 +248,7 @@ class LighterTransport:
                       'status':'error', 'attempt':attempt, 'request_ids':{}}
             retry_after = None
             transient = False
+            recovery_code = None
             attempt_started = time.monotonic()
             try:
                 remaining = 10 - (time.monotonic() - started)
@@ -211,11 +279,14 @@ class LighterTransport:
                     if not math.isfinite(delay) or delay < 0: delay = 60
                     self.budget.defer(delay)
                 transient = exc.code in (502, 503, 504)
+                if exc.code in (405, 429, 502, 503, 504):
+                    recovery_code = f'http_{exc.code}'
                 exc.close()
             except Exception as exc:
                 sample.update(error_type=type(exc).__name__)
                 sample.setdefault('outcome', 'transport_error')
                 transient = isinstance(exc, (http.client.RemoteDisconnected, ConnectionResetError))
+                recovery_code = _network_read_failure_code(exc)
             else:
                 sample.update(outcome='success', seconds=time.monotonic()-attempt_started)
                 self._record_read(sample)
@@ -228,7 +299,12 @@ class LighterTransport:
                 self._last_read_retry = time.monotonic()
                 continue
             kind = f"HTTP {sample['status']}" if sample['outcome']=='http_error' else sample['error_type']
-            raise RuntimeError(f'API read failed ({kind}) endpoint={endpoint} attempt={attempt} retry={reason}; response suppressed') from None
+            raise APIReadError(
+                f'API read failed ({kind}) endpoint={endpoint} attempt={attempt} retry={reason}; response suppressed',
+                code=recovery_code or ('http_error' if sample['outcome'] == 'http_error' else 'read_error'),
+                endpoint=endpoint,
+                automatic_recovery_allowed=(recovery_code is not None and endpoint != '/api/v1/nextNonce'),
+                http_status=sample['status'] if sample['outcome'] == 'http_error' else None) from None
 
     def account(self):
         data = self.get(f'/api/v1/account?by=index&value={self.account_index}')

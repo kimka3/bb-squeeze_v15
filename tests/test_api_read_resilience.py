@@ -5,6 +5,7 @@ import http.client
 import io
 import json
 from pathlib import Path
+import socket
 import ssl
 import sys
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from live import authenticated
-from live.authenticated import LighterTransport
+from live.authenticated import APIReadError, LighterTransport, is_transient_read_error
 from live.execution_evidence import Intent
 from live.read_diagnostics import ReadDiagnostics
 from live.request_budget import RequestBudget, RequestDeferred
@@ -181,7 +182,7 @@ def test_rate_limit_retains_durable_cooldown_and_no_retry(transport_factory, cod
 @pytest.mark.parametrize('failure', [TimeoutError('SECRET_TIMEOUT'),
     urllib.error.URLError('SECRET_DNS'), ssl.SSLError('SECRET_TLS'),
     http_error(401), http_error(403), http_error(500)])
-def test_nontransient_errors_never_retry_or_reveal_messages(transport_factory, failure):
+def test_non_immediate_retry_errors_never_retry_or_reveal_messages(transport_factory, failure):
     t, _ = transport_factory([failure])
     with pytest.raises(RuntimeError) as error:
         t.get('/api/v1/account?secret=SECRET_QUERY', private=False)
@@ -344,3 +345,169 @@ def test_malformed_endpoint_is_rejected_before_auth_or_wire(transport_factory):
         with pytest.raises(ValueError, match='invalid API path'):
             t.get(path)
     assert t.opener.calls == [] and consumed(t) == 0
+
+
+@pytest.mark.parametrize('failure,code', [
+    (http_error(405), 'http_405'),
+    (http_error(429), 'http_429'),
+    (http_error(502), 'http_502'),
+    (http_error(503), 'http_503'),
+    (http_error(504), 'http_504'),
+    (TimeoutError('SECRET_TIMEOUT'), 'read_timeout'),
+    (socket.timeout('SECRET_TIMEOUT'), 'read_timeout'),
+    (http.client.RemoteDisconnected('SECRET_DISCONNECT'), 'remote_disconnected'),
+    (ConnectionResetError('SECRET_RESET'), 'connection_reset'),
+    (ConnectionAbortedError('SECRET_ABORT'), 'connection_aborted'),
+    (socket.gaierror('SECRET_DNS'), 'dns_error'),
+    (ConnectionRefusedError('SECRET_REFUSED'), 'connection_refused'),
+    (urllib.error.URLError(TimeoutError('SECRET_TIMEOUT')), 'read_timeout'),
+    (urllib.error.URLError(ConnectionResetError('SECRET_RESET')), 'connection_reset'),
+    (urllib.error.URLError(ConnectionAbortedError('SECRET_ABORT')), 'connection_aborted'),
+    (urllib.error.URLError(socket.gaierror('SECRET_DNS')), 'dns_error'),
+    (urllib.error.URLError(ConnectionRefusedError('SECRET_REFUSED')), 'connection_refused'),
+    (urllib.error.URLError(urllib.error.URLError(TimeoutError('SECRET_TIMEOUT'))), 'read_timeout'),
+])
+def test_only_typed_transport_network_failures_are_recoverable(transport_factory, failure, code):
+    t, clock = transport_factory([failure])
+    t._last_read_retry = clock.monotonic()  # classify without changing immediate retry policy
+    with pytest.raises(APIReadError) as caught:
+        t.get('/api/v1/account?secret=SECRET_QUERY', private=False)
+    error = caught.value
+    assert type(error) is APIReadError and isinstance(error, RuntimeError)
+    assert is_transient_read_error(error)
+    assert error.code == code and error.endpoint == '/api/v1/account'
+    assert error.http_status == (failure.code if isinstance(failure, urllib.error.HTTPError) else None)
+    assert 'SECRET_' not in str(error) and 'SECRET_' not in repr(vars(error))
+    assert 'SECRET_' not in t.read_diagnostics.path.read_text()
+    assert len(t.opener.calls) == 1
+
+
+@pytest.mark.parametrize('failure', [
+    http_error(400), http_error(401), http_error(403), http_error(500),
+    ssl.SSLError('SECRET_TLS'), ssl.SSLCertVerificationError('SECRET_CERT'),
+    urllib.error.URLError(ssl.SSLError('SECRET_TLS')),
+    urllib.error.URLError(urllib.error.URLError(ssl.SSLCertVerificationError('SECRET_CERT'))),
+    urllib.error.URLError(http_error(401)),
+    urllib.error.URLError('SECRET_DNS_AS_TEXT'),
+    urllib.error.URLError(PermissionError('SECRET_FILE')),
+    PermissionError('SECRET_FILE'), FileNotFoundError('SECRET_FILE'),
+    OSError('SECRET_IO'), ValueError('SECRET_PAYLOAD'),
+    json.JSONDecodeError('SECRET_JSON', 'SECRET_BODY', 0),
+])
+def test_tls_auth_payload_and_local_failures_never_become_recoverable(transport_factory, failure):
+    t, _ = transport_factory([failure])
+    with pytest.raises(APIReadError) as caught:
+        t.get('/api/v1/account?secret=SECRET_QUERY', private=False)
+    assert not is_transient_read_error(caught.value)
+    assert caught.value.automatic_recovery_allowed is False
+    assert 'SECRET_' not in str(caught.value) and 'SECRET_' not in repr(vars(caught.value))
+    assert len(t.opener.calls) == 1
+
+
+@pytest.mark.parametrize('failure', [http_error(503), http_error(429),
+    TimeoutError('SECRET'), ConnectionResetError('SECRET'),
+    urllib.error.URLError(socket.gaierror('SECRET'))])
+def test_nonce_failure_is_never_automatic_recovery_eligible(transport_factory, failure):
+    t, _ = transport_factory([failure])
+    with pytest.raises(APIReadError) as caught:
+        t.get('/api/v1/nextNonce?account_index=SECRET_QUERY', private=False)
+    assert not is_transient_read_error(caught.value)
+    assert len(t.opener.calls) == 1
+
+
+def test_unknown_or_cyclic_url_reason_does_not_become_recoverable(transport_factory):
+    cyclic = urllib.error.URLError('SECRET')
+    cyclic.reason = cyclic
+    t, _ = transport_factory([cyclic])
+    with pytest.raises(APIReadError) as caught:
+        t.get('/api/v1/account', private=False)
+    assert not is_transient_read_error(caught.value)
+
+
+def test_classifier_does_not_accept_text_attributes_or_subclasses():
+    forged = RuntimeError('API read failed (HTTP 503)')
+    forged.automatic_recovery_allowed = True
+    assert not is_transient_read_error(forged)
+    assert not is_transient_read_error(TimeoutError('temporary'))
+    class OtherError(APIReadError):
+        pass
+    subtype = OtherError('temporary', code='http_503', endpoint='/api/v1/account',
+                         automatic_recovery_allowed=True)
+    assert not is_transient_read_error(subtype)
+
+
+@pytest.mark.parametrize('failure', [ValueError('SECRET_SIGNING_ERROR'), TimeoutError('SECRET_SIGNING_ERROR')])
+def test_auth_generation_cannot_be_misclassified_by_network_exception_name(transport_factory, failure):
+    t, _ = transport_factory([])
+    def broken_auth(**kwargs):
+        raise failure
+    t.client.create_auth_token_with_expiry = broken_auth
+    with pytest.raises(RuntimeError) as caught:
+        t.get('/api/v1/account')
+    assert not is_transient_read_error(caught.value)
+    assert t.opener.calls == []
+
+
+@pytest.mark.parametrize('failure_kind,cleanup_fails,diagnostics_failed', [
+    ('transient', False, False), ('transient', True, False), ('local', False, False),
+    ('budget', False, False), ('budget', True, False),
+    ('transient', False, True), ('transient', True, True),
+    ('budget', False, True), ('budget', True, True),
+])
+def test_constructor_preserves_only_typed_transient_read_or_budget_deferral(tmp_path, monkeypatch,
+                                                     failure_kind, cleanup_fails, diagnostics_failed):
+    monkeypatch.setattr(authenticated.importlib.metadata, 'version', lambda name: authenticated.SDK_VERSION)
+    monkeypatch.setattr(authenticated, 'read_key', lambda path: 'SECRET_KEY')
+    monkeypatch.setattr(authenticated, 'quiet_native', contextlib.nullcontext)
+    class ImmediateLoop:
+        def run_until_complete(self, coro):
+            try:
+                return coro.send(None)
+            except StopIteration as done:
+                return done.value
+    monkeypatch.setattr(authenticated.asyncio, 'new_event_loop', ImmediateLoop)
+    monkeypatch.setitem(sys.modules, 'lighter', SimpleNamespace(
+        SignerClient=lambda **kwargs: SimpleNamespace(check_client=lambda: None)))
+    if failure_kind == 'transient':
+        failure = APIReadError('safe GET error', code='http_503', endpoint='/api/v1/account',
+                              automatic_recovery_allowed=True)
+    elif failure_kind == 'budget':
+        failure = RequestDeferred(41.5)
+        failure.details = {'used': 55, 'required': 1, 'limit': 55}
+    else:
+        failure = ValueError('SECRET_LOCAL')
+    def account_failure(self):
+        if diagnostics_failed:
+            class BrokenDiagnostics:
+                def record(self, sample): raise OSError('SECRET_DIAGNOSTIC_PATH')
+            self.read_diagnostics = BrokenDiagnostics()
+            self._record_read({'timestamp_ms': 1000, 'endpoint': '/api/v1/account',
+                               'status': 503, 'attempt': 1, 'outcome': 'http_error'})
+        raise failure
+    monkeypatch.setattr(LighterTransport, 'account', account_failure)
+    cleanup = []
+    def close(self):
+        self.budget.close()
+        cleanup.append(True)
+        if cleanup_fails:
+            raise RuntimeError('SECRET_CLEANUP')
+    monkeypatch.setattr(LighterTransport, 'close', close)
+    with pytest.raises(RuntimeError) as caught:
+        LighterTransport('mainnet', 100, 4, tmp_path / 'key', '0x' + '0' * 40)
+    assert cleanup == [True]
+    assert is_transient_read_error(caught.value) is (failure_kind == 'transient' and not diagnostics_failed)
+    if diagnostics_failed:
+        assert type(caught.value) is RuntimeError
+        assert not isinstance(caught.value, (APIReadError, RequestDeferred))
+        assert 'diagnostic evidence lost' in str(caught.value)
+        assert 'manual inspection required' in str(caught.value)
+    elif failure_kind in ('transient', 'budget'):
+        assert caught.value is failure
+    else:
+        assert 'authenticated connection failed' in str(caught.value)
+    if failure_kind == 'budget' and not diagnostics_failed:
+        assert type(caught.value) is RequestDeferred
+        assert not isinstance(caught.value, APIReadError)
+        assert caught.value.retry_after == 41.5
+        assert caught.value.details == {'used': 55, 'required': 1, 'limit': 55}
+    assert 'SECRET_' not in str(caught.value)

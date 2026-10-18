@@ -78,7 +78,7 @@ The timer runs local health checks every 60 seconds after an initial 90-second
 delay. Health uses the last successful **protection/account reconciliation**,
 not a successful mark-price fetch alone. Missing/stale service success, HALT,
 pending operations, residual exits or data gaps writes `attention.json`, journals
-changes, and pauses new entries. Recovery does not clear the pause automatically.
+changes, and pauses new entries. Temporary read failures use a separate runner-owned EXCHANGE_PAUSED gate when the human activation enables automatic recovery. Recovery never clears ENTRY_PAUSED.
 The 180-second staleness threshold is an operational setting, not an observed
 worst-case response bound. Alerts are local; no email, messenger or phone push
 has been configured.
@@ -90,6 +90,49 @@ recovered gaps do not block resume. `entry_pause_reason` identifies a latched
 operator or monitor pause even after API reads recover.
 
 ## API interruptions and diagnostics
+
+### Autonomous exchange recovery
+
+The reviewed activation must contain `automatic_recovery_enabled: true`, bound
+to the deployed code fingerprint. A code installation alone does not opt in or
+start trading. After this one-time human activation the VPS runner handles
+future temporary read outages continuously; the desktop app and daily audit
+schedule are not part of this recovery mechanism.
+
+Temporary network/HTTP read failures immediately close a separate `EXCHANGE_PAUSED`
+entry gate. Existing position reconciliation and protection continue at the
+configured polling cadence. The gate opens only after three distinct complete
+market-poll and account/protection cycles spanning at least 120 monotonic seconds,
+with no intervening failed cycle and no gap exceeding 90 seconds. Counters reset
+on failure and restart. There are no extra diagnostic API calls or test orders.
+Both the actual account/order ledger reconciliation and the latest completed
+signal bar must be verified; HALT, unresolved orders, residual exits, orphan
+orders, current collection gaps and diagnostic storage failures block recovery.
+
+Temporary read failures during bootstrap also wait at the existing poll interval
+instead of exhausting systemd crash restarts. A local request-budget cooldown
+retains its own reason and is not evidence of an exchange outage. Authentication,
+identity, schema, local storage and uncertain order-operation failures do not
+gain automatic authorization to resume. The durable manual `ENTRY_PAUSED` latch,
+including an operator stop and old monitor latches, is never removed by recovery.
+Non-transient failure evidence survives a crash before the manual latch is made.
+
+The health timer still flags unresolved issues. Only an activated runner's owned,
+current recovery gate can explain stale poll/reconciliation timestamps without
+creating an additional permanent manual pause. A stale runner heartbeat, invalid
+activation or malformed marker remains a manual attention condition.
+
+Recovered entry permission applies only to eligible future signals. Closed bars,
+entry deadlines (60 seconds), budget reserves (24/20), sizing, exits and strategy
+rules are unchanged. Signals that expired while offline are never replayed;
+long outages causing genuine strategy data gaps/HALT still require inspection.
+Successful reads cannot prove that a future transaction will be accepted. The
+existing uncertain-submission handling and no-blind-resend rule still apply.
+
+`runner_status.json.automatic_recovery`, `EXCHANGE_PAUSED`, and the journal events
+`exchange_recovery_started`, `exchange_recovery_failure`, `exchange_recovery_ready`
+explain the current stage and completion. Historical outage/performance records
+are preserved. These controls do not guarantee zero downtime or zero missed signals.
 
 Quick HTTP 502/503/504 or direct connection-close/reset failures may get one
 additional GET attempt. At most one extra attempt per transport per 60.1 seconds
@@ -120,7 +163,7 @@ restart/resume. A later successful log write does not restore missing evidence.
 An exchange maintenance window can disable API and transaction processing.
 Retries cannot make such an exchange available or guarantee a native stop will
 execute while matching is unavailable. Check the official status/announcement
-channels for planned windows. Keep the safety pause on prolonged interruption;
+channels for planned windows. Keep the safety pause throughout interruption and until recovery checks pass;
 do not extend stale prices, entry deadlines or health thresholds to hide it.
 
 Install units from `scripts/*.service.in` with explicit reviewed paths. Verify
