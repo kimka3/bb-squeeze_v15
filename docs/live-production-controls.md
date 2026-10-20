@@ -126,6 +126,13 @@ Recovered entry permission applies only to eligible future signals. Closed bars,
 entry deadlines (60 seconds), budget reserves (24/20), sizing, exits and strategy
 rules are unchanged. Signals that expired while offline are never replayed;
 long outages causing genuine strategy data gaps/HALT still require inspection.
+For an already ready controller with fresh successful cycles, the immediately
+preceding signal bar may remain recorded while the next bar is fetched, strictly
+inside the configured entry grace window. This normal boundary transition does
+not start another outage confirmation period. It never applies to startup,
+failed/stale recovery, a bar more than one interval behind, or any other safety
+blocker. The signal handler still validates and processes the new closed bar
+before entry; no entry deadline is extended and no old signal is replayed.
 Successful reads cannot prove that a future transaction will be accepted. The
 existing uncertain-submission handling and no-blind-resend rule still apply.
 

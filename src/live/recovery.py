@@ -6,6 +6,8 @@ provide recovery evidence. A human-approved deployment opts in via activation.
 from __future__ import annotations
 
 import json
+import math
+from numbers import Real
 import os
 from pathlib import Path
 import tempfile
@@ -135,10 +137,27 @@ class ExchangeRecovery:
             self._persist()
 
     def can_enter(self):
+        return self._can_enter_at(self.monotonic())
+
+    def _can_enter_at(self, current_time):
         return (self.ready and not self.storage_error and not self.path.exists()
                 and not (self.directory/'ENTRY_PAUSED').exists()
                 and self.last_success is not None
-                and 0 <= self.monotonic()-self.last_success <= MAX_CYCLE_GAP_SECONDS)
+                and 0 <= current_time-self.last_success <= MAX_CYCLE_GAP_SECONDS)
+
+    def _normal_bar_transition(self, trader, expected, now_ms, current_time):
+        """Retain fresh permission while the next signal bar is being fetched.
+
+        This is not recovery evidence: an unready, failed or stale controller
+        must still process the latest closed bar before counting successes.
+        """
+        grace = getattr(getattr(trader, 'config', None), 'bar_grace_seconds', None)
+        return (isinstance(grace, Real) and not isinstance(grace, bool)
+                and math.isfinite(grace) and grace > 0
+                and self._can_enter_at(current_time)
+                and self.last_cycle_ms is not None and now_ms > self.last_cycle_ms
+                and trader.last_bar_ms == expected-H4
+                and 0 <= now_ms-(expected+H4) < grace*1000)
 
     def cycle(self, trader, coverage, *, poll_ok, service_ok, now_ms):
         """Called once after a complete normal poll + service cycle, never by timer."""
@@ -155,9 +174,14 @@ class ExchangeRecovery:
         current = coverage.snapshot()
         gaps=current.get('active_gap_streams') if isinstance(current,dict) else None
         if not isinstance(gaps,list) or gaps: problems.append('active_data_gap')
-        # Latest completed signal bar must be processed. Never replay missed entries.
+        # Poll/service can finish before the asynchronous new-bar fetch. Preserve
+        # an already healthy gate for that one-bar transition only within the
+        # existing entry window; startup/outage recovery still needs the new bar.
         expected = now_ms//H4*H4-H4
-        if trader.last_bar_ms != expected: problems.append('confirmed_bar_not_current')
+        current_time = self.monotonic()
+        if (trader.last_bar_ms != expected
+                and not self._normal_bar_transition(trader, expected, now_ms, current_time)):
+            problems.append('confirmed_bar_not_current')
         if problems:
             self._reset(); self.blockers = problems
             self.reason = ('manual_inspection_required' if 'diagnostics' in problems
@@ -165,7 +189,6 @@ class ExchangeRecovery:
             self._persist()
             return
         self.blockers = []
-        current_time = self.monotonic()
         if (self.last_cycle_ms is not None and now_ms <= self.last_cycle_ms):
             return  # Re-reading the same status can never count as a new cycle.
         if self.last_success is not None and not 0 <= current_time-self.last_success <= MAX_CYCLE_GAP_SECONDS:
