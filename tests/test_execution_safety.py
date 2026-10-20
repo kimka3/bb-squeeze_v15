@@ -91,6 +91,7 @@ def seed(trader):
     trader.positions['ETHUSDT'] = {
         'side': 'SHORT', 'qty': 10., 'initial_qty': 10., 'entry': 100.,
         'stop': 104., 'tp2r': 92., 'partial_taken': False, 'bars': 1,
+        'entry_ms': START,
     }
     trader.broker.positions['ETH'] = {'side': 'SHORT', 'qty': 10., 'entry': 100.,
                                       'partial_taken': False}
@@ -171,14 +172,22 @@ def enter(trader):
                   rows, START + H4, BarOutcome(START, 100000.), 100000.)
 
 
+def pending_operations(trader):
+    """Uncertain work may be isolated so unrelated protection can continue."""
+    active = [trader.pending_operation] if trader.pending_operation is not None else []
+    return active + list(trader.unresolved_operations.values())
+
+
 def test_lost_entry_reply_recovers_fill_and_protection_without_reentry(tmp_path):
     trader = trader_for(tmp_path)
     trader.broker.lose_entry_reply = True
     enter(trader)
-    assert trader.pending_operation['kind'] == 'entry'
+    assert len(pending_operations(trader)) == 1
+    assert pending_operations(trader)[0]['kind'] == 'entry'
     restarted = trader_for(tmp_path, trader.broker)
     restarted.service(now_ms=START + H4)
     assert restarted.pending_operation is None
+    assert not restarted.unresolved_operations
     assert 'SL' in restarted.orders['ETHUSDT']
     assert len([row for row in trader.broker.log if row['op'] == 'market']) == 1
     assert restarted.halted  # Recovery does not silently clear the durable alert.
@@ -189,25 +198,28 @@ def test_tp_registration_failure_preserves_entry_and_accepted_stop(tmp_path):
     trader.broker.fail_tp = True
     enter(trader)
     snap = Journal(tmp_path).load_snapshot()
-    assert snap['pending_operation']['phase'] == 'protect'
+    assert len(snap['unresolved_operations']) == 1
+    assert next(iter(snap['unresolved_operations'].values()))['phase'] == 'protect'
     assert 'ETHUSDT' in snap['positions']
     assert 'SL' in snap['orders']['ETHUSDT']
     trader.broker.fail_tp = False
     restarted = trader_for(tmp_path, trader.broker)
     restarted.service(now_ms=START + H4)
     assert restarted.pending_operation is None
+    assert not restarted.unresolved_operations
     assert set(restarted.orders['ETHUSDT']) == {'SL', 'TP'}
     assert len([row for row in trader.broker.log if row['op'] == 'stop']) == 1
 
 
 def test_unknown_pending_intent_never_retransmits(tmp_path):
     trader = trader_for(tmp_path)
-    trader.pending_operation = {'kind': 'entry', 'coi': 77, 'symbol': 'ETHUSDT'}
+    trader.pending_operation = {'kind': 'entry', 'coi': 77, 'symbol': 'ETHUSDT', 'bar_ms': START}
     trader._save()
     restarted = trader_for(tmp_path, trader.broker)
     restarted.service(now_ms=START)
     assert restarted.halted
-    assert restarted.pending_operation is not None
+    assert len(pending_operations(restarted)) == 1
+    assert pending_operations(restarted)[0]['coi'] == 77
     assert trader.broker.log == []
 
 
@@ -244,7 +256,9 @@ def test_stop_amend_failure_has_durable_unknown_outcome(tmp_path):
     trader._sync_protective_orders(BarOutcome(START, 100000.), START)
     assert trader.halted
     assert trader.orders['ETHUSDT']['SL']['trigger'] == 104.
-    assert Journal(tmp_path).load_snapshot()['pending_operation']['kind'] == 'amend'
+    snapshot = Journal(tmp_path).load_snapshot()
+    assert len(snapshot['unresolved_operations']) == 1
+    assert next(iter(snapshot['unresolved_operations'].values()))['kind'] == 'amend'
 
 
 @pytest.mark.parametrize('method,args', [
@@ -325,11 +339,13 @@ def test_confirmed_entry_recovery_waits_for_fresh_mark_before_placing_stop(tmp_p
     enter(trader)
     restarted = trader_for(tmp_path, trader.broker)
     restarted.service(now_ms=START + H4, marks={})
-    assert restarted.pending_operation['phase'] == 'protect'
+    assert len(pending_operations(restarted)) == 1
+    assert pending_operations(restarted)[0]['phase'] == 'protect'
     assert 'ETHUSDT' in restarted.positions
     assert not restarted.orders
     restarted.service(now_ms=START + H4, marks={'ETHUSDT': 100.})
     assert restarted.pending_operation is None
+    assert not restarted.unresolved_operations
     assert 'SL' in restarted.orders['ETHUSDT']
 
 
@@ -341,6 +357,7 @@ def test_protection_recovery_accepts_ledger_confirmed_flat_without_reopening(tmp
     restarted = trader_for(tmp_path, trader.broker)
     restarted.service(now_ms=START + H4, marks={})
     assert restarted.pending_operation is None
+    assert not restarted.unresolved_operations
     assert restarted.positions == {}
     assert restarted.orders == {}
     assert len([row for row in trader.broker.log if row['op'] == 'market']) == 1

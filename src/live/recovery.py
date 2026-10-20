@@ -166,7 +166,7 @@ class ExchangeRecovery:
         if not poll_ok or not service_ok:
             self._reset(); self._persist(); return
         problems = []
-        for name in ('halted','pending_operation','residual_exits','orphan_orders','data_gaps'):
+        for name in ('halted','pending_operation','unresolved_operations','residual_exits','orphan_orders','data_gaps'):
             if getattr(trader, name, None): problems.append(name)
         if getattr(trader.broker.transport, 'read_diagnostics_error', None): problems.append('diagnostics')
         if trader.broker.last_report.get('execution_changes_verified') is not True:

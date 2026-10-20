@@ -48,6 +48,7 @@ class OrderRef:
     trigger: float | None = None
     qty: float | None = None
     position_side: str = ''
+    order_expiry_ms: int | None = None
 
 
 @dataclass

@@ -125,6 +125,7 @@ def health(live,*,active=True,now_ms=None,for_resume=False):
         detail='; '.join(reasons) if isinstance(reasons,list) and all(isinstance(r,str) for r in reasons) else 'reason unavailable'
         issues.append('persistent strategy HALT: '+detail)
     if state.get('pending_operation'):issues.append('unresolved order operation')
+    if state.get('unresolved_operations'):issues.append('isolated unresolved order operations')
     if state.get('residual_exits'):issues.append('residual position requires close reconciliation')
     if state.get('orphan_orders'):issues.append('orphan orders require reconciliation')
     if state.get('data_gaps'):issues.append('signal data gap unresolved')
@@ -289,7 +290,7 @@ def main():
                 file=live.state_dir/'runner_status.json'
                 state=json.loads(file.read_text()) if file.exists() else {}
                 if (state.get('entry_pause_observed_ms') or 0)>=paused_at:
-                    if state.get('pending_operation') or state.get('residual_exits'):
+                    if state.get('pending_operation') or state.get('unresolved_operations') or state.get('residual_exits'):
                         raise RuntimeError('unresolved execution; protection service kept running')
                     break
                 time.sleep(1)

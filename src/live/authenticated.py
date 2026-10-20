@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 from .request_budget import RequestBudget, RequestDeferred
 from .read_diagnostics import ReadDiagnostics, sanitize_sample
+from .execution_evidence import NotSubmitted
 
 HOSTS = {'mainnet': 'https://mainnet.zklighter.elliot.ai',
          'testnet': 'https://testnet.zklighter.elliot.ai'}
@@ -334,22 +335,39 @@ class LighterTransport:
         return rows[0] if rows else None
 
     def _send(self, coro, *, deadline_ms=None):
-        # An error or lost response is ambiguous. The execution engine must
-        # reconcile the durable intent; it must never blindly resend it.
+        # Before run_until_complete no coroutine body (and no transaction) has
+        # run. After it starts every failure is ambiguous, including any typed
+        # exception thrown inside the coroutine. Never retry dispatch here.
         try:
-            try:
-                self.budget.check(consume=True)
-                if deadline_ms is not None and time.time()*1000>=deadline_ms:
-                    raise RuntimeError('entry deadline elapsed before transaction send')
-            except Exception:
-                coro.close()
-                raise
+            self.budget.check(consume=True)
+        except Exception as exc:
+            coro.close()
+            raise NotSubmitted('request_budget_deferred' if isinstance(exc, RequestDeferred)
+                               else 'dispatch_budget_check_failed',
+                               retryable=isinstance(exc, RequestDeferred), cause=exc) from None
+        try:
+            expired = deadline_ms is not None and time.time()*1000 >= deadline_ms
+        except Exception as exc:
+            coro.close()
+            raise NotSubmitted('dispatch_clock_check_failed', cause=exc) from None
+        if expired:
+            coro.close()
+            raise NotSubmitted('entry_deadline_elapsed')
+        try:
             with quiet_native():
                 _, response, error = self.loop.run_until_complete(asyncio.wait_for(coro, timeout=15))
             if error is not None or response is None or response.code != 200:
                 raise RuntimeError('submission not acknowledged')
         except Exception:
             raise RuntimeError('submission outcome requires reconciliation') from None
+
+    def _submission_nonce(self):
+        try:
+            return self._next_nonce()
+        except Exception as exc:
+            raise NotSubmitted('nonce_unavailable',
+                               retryable=isinstance(exc, RequestDeferred) or is_transient_read_error(exc),
+                               cause=exc) from None
 
     def submit(self, intent, base_amount, price, trigger):
         c = self.client
@@ -358,12 +376,12 @@ class LighterTransport:
         times = {'immediate-or-cancel': c.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                  'post-only': c.ORDER_TIME_IN_FORCE_POST_ONLY,
                  'good-till-time': c.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME}
-        nonce=self._next_nonce()
+        nonce=self._submission_nonce()
         if not intent.reduce_only and getattr(self, 'read_diagnostics_error', None):
-            raise RuntimeError('API diagnostic evidence lost; new entry refused')
+            raise NotSubmitted('api_diagnostic_evidence_lost')
         deadline=getattr(self,'new_entry_deadline_ms',None)
         if not intent.reduce_only and deadline is not None and time.time()*1000>=deadline:
-            raise RuntimeError('entry deadline elapsed; transaction not sent')
+            raise NotSubmitted('entry_deadline_elapsed')
         self._send(c.create_order(market_index=intent.market_index,
             client_order_index=intent.client_order_index, base_amount=base_amount,
             price=price, trigger_price=trigger, is_ask=intent.is_ask,
@@ -375,12 +393,12 @@ class LighterTransport:
 
     def cancel(self, market_index, order_index):
         self._send(self.client.cancel_order(market_index=market_index,
-            order_index=order_index, api_key_index=self.api_key_index, nonce=self._next_nonce()))
+            order_index=order_index, api_key_index=self.api_key_index, nonce=self._submission_nonce()))
 
     def amend(self, market_index, order_index, base_amount, price, trigger):
         self._send(self.client.modify_order(market_index=market_index,
             order_index=order_index, base_amount=base_amount, price=price,
-            trigger_price=trigger, api_key_index=self.api_key_index, nonce=self._next_nonce()))
+            trigger_price=trigger, api_key_index=self.api_key_index, nonce=self._submission_nonce()))
 
     def _next_nonce(self):
         # SDK explicit api_key_index uses caller-managed nonces. Query the

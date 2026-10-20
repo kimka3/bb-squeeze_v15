@@ -164,16 +164,30 @@ class AccountLedger:
 No allocation by current position, current price or market funding rate. A fill
 at the same timestamp as settlement makes ordering ambiguous and stays unknown.
 """
-        out=[]
-        for funding in self.events('funding'):
-            held={}; ambiguous=False
-            for trade in self.events('trade'):
-                if trade['market_id']!=funding['market_id'] or trade['timestamp_ms']>funding['timestamp_ms']: continue
-                if trade['timestamp_ms']==funding['timestamp_ms']: ambiguous=True
-                binding=bindings.get(trade['coi'])
-                if binding is None: ambiguous=True; continue
-                cycle=binding['cycle']
-                held[cycle]=held.get(cycle,Decimal(0))+number(trade['qty'])*(-1 if trade['is_ask'] else 1)
-            candidates=[c for c,q in held.items() if q and ('long' if q>0 else 'short')==funding['position_side']]
-            out.append({**funding,'cycle':candidates[0] if len(candidates)==1 and not ambiguous else None})
+        # One ordered pass per market. Re-reading/deserializing the complete
+        # trade table for every settlement made a growing live ledger quadratic.
+        # Keep exact timestamp ambiguity and unowned-fill rules unchanged.
+        fundings=self.events('funding'); trades_by_market={}; funding_by_market={}
+        for trade in self.events('trade'):
+            trades_by_market.setdefault(trade['market_id'],[]).append(trade)
+        for index,funding in enumerate(fundings):
+            funding_by_market.setdefault(funding['market_id'],[]).append((index,funding))
+        out=[None]*len(fundings)
+        for market,settlements in funding_by_market.items():
+            trades=sorted(trades_by_market.get(market,[]),key=lambda row:row['timestamp_ms'])
+            held={}; cursor=0; unowned_seen=False; latest_trade_ms=None
+            for index,funding in sorted(settlements,key=lambda item:item[1]['timestamp_ms']):
+                while cursor<len(trades) and trades[cursor]['timestamp_ms']<=funding['timestamp_ms']:
+                    trade=trades[cursor]; cursor+=1; latest_trade_ms=trade['timestamp_ms']
+                    binding=bindings.get(trade['coi'])
+                    if binding is None:
+                        unowned_seen=True
+                        continue
+                    cycle=binding['cycle']
+                    quantity=held.get(cycle,Decimal(0))+number(trade['qty'])*(-1 if trade['is_ask'] else 1)
+                    if quantity: held[cycle]=quantity
+                    else: held.pop(cycle,None)
+                ambiguous=unowned_seen or latest_trade_ms==funding['timestamp_ms']
+                candidates=[c for c,q in held.items() if ('long' if q>0 else 'short')==funding['position_side']]
+                out[index]={**funding,'cycle':candidates[0] if len(candidates)==1 and not ambiguous else None}
         return out

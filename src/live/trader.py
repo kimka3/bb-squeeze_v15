@@ -30,6 +30,8 @@ from . import guards
 from .broker import Fill
 from .journal import client_order_index
 from .request_budget import EntryDeferred, RequestDeferred
+from .execution_evidence import NotSubmitted
+from .stop_renewal import start_renewal, recover_renewal
 
 
 @dataclass
@@ -69,6 +71,7 @@ class Trader:
         self.orders: dict[str, dict] = snap.get('orders', {})
         self.last_bar_ms: int = snap.get('last_bar_ms', 0)
         self.pending_operation = snap.get('pending_operation')
+        self.unresolved_operations = dict(snap.get('unresolved_operations', {}))
         self.inflight_bar_ms = snap.get('inflight_bar_ms')
         self.halted = bool(snap.get('halted', False))
         self.halt_reasons = list(snap.get('halt_reasons', []))
@@ -76,7 +79,7 @@ class Trader:
         self.orphan_orders = dict(snap.get('orphan_orders', {}))
         self.data_gaps = list(snap.get('data_gaps', []))
         self.protection_generation = dict(snap.get('protection_generation', {}))
-        self._needs_recovery = bool(self.pending_operation or self.inflight_bar_ms)
+        self._needs_recovery = bool(self.pending_operation or self.unresolved_operations or self.inflight_bar_ms)
         # Unsubmitted candidates are deliberately not restored after a restart.
         self.deferred_entries = None
 
@@ -102,7 +105,7 @@ class Trader:
         now = self._entry_now_ms()
         guard = getattr(self.broker, 'entry_guard', None)
         if (now >= batch['deadline_ms'] or now < batch['bar_ms']+H4
-                or self.halted or self.pending_operation or self.data_gaps
+                or self.halted or self.pending_operation or self.unresolved_operations or self.data_gaps
                 or (guard is not None and not guard())):
             self.journal.append('entry_deferred_discarded', bar_ms=batch['bar_ms'],
                                 symbols=list(batch['requests']),
@@ -173,6 +176,7 @@ class Trader:
             'pending': {k: list(v) for k, v in self.pending.items()},
             'orders': self.orders, 'last_bar_ms': self.last_bar_ms,
             'pending_operation': self.pending_operation,
+            'unresolved_operations': self.unresolved_operations,
             'inflight_bar_ms': self.inflight_bar_ms,
             'halted': self.halted, 'halt_reasons': self.halt_reasons,
             'residual_exits': self.residual_exits, 'orphan_orders': self.orphan_orders,
@@ -190,6 +194,53 @@ class Trader:
             raise RuntimeError('an unresolved operation already exists; refusing another order')
         self.pending_operation = operation
         self._save()  # Write-ahead intent: before ANY broker mutation.
+
+    def _park_operation(self):
+        """Isolate an uncertain operation without losing its durable identity."""
+        if self.pending_operation is not None:
+            op = self.pending_operation
+            key = f'{op["symbol"]}:{op["kind"]}:{op.get("coi", op["bar_ms"])}'
+            previous = self.unresolved_operations.get(key)
+            if previous is not None and previous != op:
+                raise RuntimeError('unresolved operation identity collision')
+            self.unresolved_operations[key] = op
+            self.pending_operation = None
+            self._needs_recovery = True
+            self._save()
+
+    def _symbol_verified(self, state, symbol):
+        return (state.execution_changes_verified or
+                self.config_symbol_map[symbol] in state.ledger_report.get('verified_symbols', []))
+
+    def _uncertain_market_order(self, symbol):
+        ops = list(self.unresolved_operations.values()) + ([self.pending_operation] if self.pending_operation else [])
+        return any(op['symbol'] == symbol and op['kind'] in ('entry', 'exit')
+                   and op.get('phase') != 'protect' for op in ops)
+
+    def _not_submitted(self, op, exc, out):
+        """Positive pre-dispatch proof is not an unknown exchange outcome."""
+        self.journal.append('operation_not_submitted', symbol=op['symbol'], operation_kind=op['kind'],
+                            coi=op.get('coi'), reason=exc.reason, retryable=exc.retryable)
+        if op['kind'] == 'entry' and op.get('phase') != 'protect':
+            self.pending_operation = None
+            out.skipped.append((op['symbol'], f'not submitted: {exc.reason}'))
+        elif op['kind'] == 'exit':
+            self.residual_exits[op['symbol']] = {
+                'reason': op['reason'], 'bar_ms': op['bar_ms'], 'attempt': op['attempt'],
+                'cycle_ms': self.positions[op['symbol']]['entry_ms']}
+            self.pending_operation = None
+        else:
+            # Retain protective work, with the exact ID/terms, for a fresh
+            # account check next service cycle. The engine permits retry only
+            # when durable local evidence proves dispatch never started.
+            self._park_operation()
+        self._save()
+        cause = exc.cause
+        if cause is not None and hasattr(cause, 'automatic_recovery_allowed'):
+            # Preserve the existing classification and recovery thresholds.
+            raise cause
+        if not exc.retryable and exc.reason not in ('entry_deadline_elapsed', 'new_entries_paused'):
+            self._halt(f'{op["symbol"]}: submission refused: {exc.reason}')
 
     def _coi(self, bar_ms, symbol, purpose, seq=0):
         value=client_order_index(bar_ms,symbol,purpose,seq)
@@ -215,9 +266,10 @@ class Trader:
                 live[strat] = pos
         for symbol in list(self.positions):
             p = self.positions[symbol]
+            verified = self._symbol_verified(state, symbol)
             actual = live.get(symbol)
             if actual is None:
-                if not state.execution_changes_verified:
+                if not verified:
                     self._halt(f'{symbol}: unexplained disappearance; execution evidence required')
                     continue
                 notes.append(f'{symbol}: closure confirmed by execution ledger')
@@ -230,12 +282,12 @@ class Trader:
                 self._halt(f'{symbol}: position side changed unexpectedly')
                 continue
             if actual['qty'] < p['qty'] - 1e-12:
-                if not state.execution_changes_verified:
+                if not verified:
                     self._halt(f'{symbol}: unexplained reduction; execution evidence required')
                     continue
                 p['qty'] = float(actual['qty'])
                 notes.append(f'{symbol}: ledger-confirmed residual quantity {p["qty"]}')
-            if (state.execution_changes_verified and actual.get('partial_taken') is True
+            if (verified and actual.get('partial_taken') is True
                     and not p['partial_taken']):
                 apply_tp_fill(p)
                 notes.append(f'{symbol}: complete TP leg confirmed; breakeven armed')
@@ -257,7 +309,7 @@ class Trader:
                           (s in samples and 0 <= now_ms - samples[s] <= max_age))}
         initial_state = self.broker.account_state()
         out = BarOutcome(now_ms, initial_state.equity)
-        state_may_change = bool(self.orphan_orders or self._needs_recovery)
+        state_may_change = bool(self.orphan_orders or self._needs_recovery or self.unresolved_operations)
         for symbol, refs in list(self.orphan_orders.items()):
             unresolved = {}
             for purpose, ref in refs.items():
@@ -270,8 +322,17 @@ class Trader:
                 self.orphan_orders[symbol] = unresolved
             else:
                 self.orphan_orders.pop(symbol, None)
-        if self._needs_recovery:
-            self._recover_operation(out, fresh_symbols)
+        if self._needs_recovery or self.unresolved_operations:
+            self._park_operation()
+            # Each symbol's intent is checkpointed before lookup; a crash at
+            # any point retains either the parked or active representation.
+            for key in list(self.unresolved_operations):
+                self.pending_operation = self.unresolved_operations.pop(key)
+                self._save()
+                try:
+                    self._recover_operation(out, fresh_symbols)
+                finally:
+                    self._park_operation()
             if self.pending_operation is None:
                 if self.inflight_bar_ms is not None:
                     self.last_bar_ms = max(self.last_bar_ms, self.inflight_bar_ms)
@@ -279,7 +340,7 @@ class Trader:
                                         reason='completed actions retained; remaining entries skipped')
                     self.inflight_bar_ms = None
                     self.pending.clear()
-                self._needs_recovery = False
+                self._needs_recovery = bool(self.unresolved_operations)
                 self._save()
         state = self.broker.account_state() if state_may_change else initial_state
         out.reasons += self._sync_fills(state)
@@ -292,33 +353,58 @@ class Trader:
             for reason in mismatch.reasons:
                 self._halt(reason)
             out.reasons += mismatch.reasons
-        if self.pending_operation is None and not mismatch.halt:
+        if self.pending_operation is None:
+            safe_symbols = set()
+            for symbol, p in self.positions.items():
+                actual = state.positions.get(self.config_symbol_map[symbol])
+                if (self._symbol_verified(state, symbol) and actual
+                        and actual['side'] == p['side']
+                        and math.isclose(float(actual['qty']), float(p['qty']), rel_tol=1e-9, abs_tol=1e-12)
+                        and not self._uncertain_market_order(symbol)):
+                    safe_symbols.add(symbol)
             # A missing SL after an IOC trigger is an emergency residual, not a
             # successful stop. Try only confirmed reduce-only close operations.
             if state.active_orders_verified:
                 for symbol in list(self.positions):
+                    if symbol not in safe_symbols:
+                        continue
                     active = state.active_orders.get(self.config_symbol_map[symbol], [])
                     sl = (self.orders.get(symbol) or {}).get('SL')
                     found = sl and any(o.get('client_order_index') == sl['client_order_index']
-                                       and o.get('purpose') == 'SL' for o in active)
+                                       and o.get('purpose') == 'SL' and o.get('armed', True) for o in active)
                     if not found:
+                        # A positively unsent protective order can be retried;
+                        # a missing outcome after dispatch cannot. Leave its
+                        # durable operation for late evidence and close only
+                        # the independently reconciled exposure below.
+                        unsent = state.ledger_report.get('not_submitted_orders', {})
+                        if any(v.get('symbol') == symbol and v.get('role') == 'SL'
+                               and v.get('retryable') for v in unsent.values()):
+                            continue
                         self._halt(f'{symbol}: protective stop missing; entries halted')
                         if sl:
                             self.protection_generation[symbol] = self.protection_generation.get(symbol, 0) + 1
+                            self.orphan_orders.setdefault(symbol, {})[f'SL:{sl["client_order_index"]}'] = dict(sl)
                         self.orders.setdefault(symbol, {}).pop('SL', None)
                         self.residual_exits.setdefault(symbol, {
-                            'reason': 'PROTECTION_LOST', 'bar_ms': now_ms, 'attempt': 0})
+                            'reason': 'PROTECTION_LOST', 'bar_ms': now_ms, 'attempt': 0,
+                            'cycle_ms': self.positions[symbol]['entry_ms']})
             for symbol, request in list(self.residual_exits.items()):
                 if self.pending_operation is not None:
                     break
-                if symbol in self.positions and symbol in fresh_symbols:
+                if (symbol in self.positions and request.get('cycle_ms', self.positions[symbol]['entry_ms'])
+                        != self.positions[symbol]['entry_ms']):
+                    self._halt(f'{symbol}: residual exit belongs to a different position cycle')
+                    continue
+                if symbol in safe_symbols and symbol in fresh_symbols:
                     self._exit(symbol, request['reason'], marks, request['bar_ms'], out)
                 elif symbol in self.positions:
                     out.reasons.append(f'{symbol}: residual close awaits a fresh mark')
             if self.pending_operation is None:
-                self._sync_protective_orders(out, now_ms, fresh_symbols=fresh_symbols)
+                self._sync_protective_orders(out, now_ms, fresh_symbols=fresh_symbols,
+                                             allowed_symbols=safe_symbols, state=state)
         out.halted = (self.halted or self.pending_operation is not None
-                      or bool(self.residual_exits) or bool(self.orphan_orders))
+                      or bool(self.unresolved_operations) or bool(self.residual_exits) or bool(self.orphan_orders))
         out.reasons += self.halt_reasons
         self._save()
         return out
@@ -328,7 +414,9 @@ class Trader:
         if op is None:
             return
         try:
-            if op['kind'] in ('entry', 'exit') and op.get('phase') != 'protect':
+            if op['kind'] == 'stop_renewal':
+                recover_renewal(self, op, out, now_ms=out.bar_ms, fresh_symbols=fresh_symbols)
+            elif op['kind'] in ('entry', 'exit') and op.get('phase') != 'protect':
                 lookup = getattr(self.broker, 'market_order_result', None)
                 fill = lookup(op['coi']) if lookup else None
                 if fill is None:
@@ -340,20 +428,35 @@ class Trader:
                     self._finish_exit(op, fill, out)
             elif op['kind'] == 'protection' or op.get('phase') == 'protect':
                 state = self.broker.account_state()
-                if (state.execution_changes_verified and
+                if (self._symbol_verified(state, op['symbol']) and
                         self.config_symbol_map[op['symbol']] not in state.positions):
                     # An already-accepted stop may have closed the paper position
                     # before restart could finish registering the other leg.
                     self._cancel_protective(op['symbol'], self.markets[op['symbol']])
+                    # A late accepted SL/TP may never have reached orders[].
+                    # Cancel that exact owned ID only after verified flatness;
+                    # absence is still not proof an uncertain send was rejected.
+                    for ref in state.active_orders.get(self.config_symbol_map[op['symbol']], []):
+                        if ref.get('purpose') in ('SL', 'TP'):
+                            self.broker.cancel(self.markets[op['symbol']], self._order_ref(ref))
                     self.positions.pop(op['symbol'], None)
                     self.orders.pop(op['symbol'], None)
                     self.residual_exits.pop(op['symbol'], None)
+                    if any(v.get('symbol') == op['symbol'] and v.get('role') in ('SL', 'TP')
+                           for v in state.ledger_report.get('unresolved_orders', {}).values()):
+                        self._save()
+                        return
                     self.pending_operation = None
                     self._save()
                     return
                 if op['symbol'] not in fresh_symbols:
                     out.reasons.append(f'{op["symbol"]}: protection recovery awaits a fresh mark')
                     return
+                if not self._symbol_verified(state, op['symbol']):
+                    return
+                if any(v.get('symbol') == op['symbol'] and v.get('role') == 'SL'
+                       for v in state.ledger_report.get('unresolved_orders', {}).values()):
+                    return  # Service will close verified exposure, never duplicate this SL.
                 self._place_protective(op['symbol'], op['bar_ms'])
                 self.pending_operation = None
                 self._save()
@@ -361,8 +464,14 @@ class Trader:
                 # A simulator exposes an exact active-order ledger. For other
                 # adapters no acknowledgement is fabricated from position size.
                 state = self.broker.account_state()
-                if (state.execution_changes_verified and
+                if (self._symbol_verified(state, op['symbol']) and
                         self.config_symbol_map[op['symbol']] not in state.positions):
+                    active = state.active_orders.get(self.config_symbol_map[op['symbol']], [])
+                    late = next((row for row in active if row.get('client_order_index') == op['coi']), None)
+                    if late is not None:
+                        self.broker.cancel(self.markets[op['symbol']], self._order_ref(late))
+                    elif str(op['coi']) in state.ledger_report.get('unresolved_orders', {}):
+                        return  # A missing amended stop may still appear later.
                     self.pending_operation = None
                     self._save()  # subsequent fill sync cancels remaining protection
                     return
@@ -373,11 +482,18 @@ class Trader:
                 if check and check(op['coi'], op['qty'], op['trigger']):
                     match = next((o for o in active if o.get('client_order_index') == op['coi']), None)
                 if not state.active_orders_verified or match is None:
-                    self._halt('stop amendment outcome unknown; manual reconciliation required')
-                    return
+                    if not self._symbol_verified(state, op['symbol']) or op['symbol'] not in fresh_symbols:
+                        return
+                    sl = self.orders.get(op['symbol'], {}).get('SL')
+                    if not sl:
+                        return
+                    self.broker.modify_stop(self.markets[op['symbol']], self._order_ref(sl),
+                                            op['qty'], op['trigger'])
                 self.orders[op['symbol']]['SL'].update(trigger=op['trigger'], qty=op['qty'])
                 self.pending_operation = None
                 self._save()
+        except NotSubmitted as exc:
+            self._not_submitted(op, exc, out)
         except Exception as exc:
             self._halt(f'operation recovery failed: {exc}')
 
@@ -437,6 +553,8 @@ class Trader:
             self.journal.append('bar_skipped', bar_ms=bar_ms, reasons=fresh.reasons)
             return out
 
+        held_at = getattr(self.broker, 'held_symbols_at', None)
+        held_at_close = held_at(entry_ms) if held_at is not None else set(self.positions)
         out.reasons += self._sync_fills(state)
 
         mismatch = guards.reconcile(self.positions, state, self.config_symbol_map)
@@ -475,7 +593,8 @@ class Trader:
         # is skipped, exactly as the backtest skips it.
         # pending is derived fresh every bar, never carried across a restart.
         self.pending, filtered = scan_signals(bar_ms, rows, self.universe, self.longs,
-                                              self.positions, self.setups, self.cfg)
+                                              {**{s: {} for s in held_at_close}, **self.positions},
+                                              self.setups, self.cfg)
 
         # The new bar's open is unobservable at the moment we act, so the live
         # reference is the current Lighter mark — which is also where the order
@@ -485,11 +604,23 @@ class Trader:
         # that follows it in the same bar.
         opens = {s: float(marks.get(s, rows[s]['close'])) for s in rows}
 
+        # Commit all close decisions and the one-time bar state before any
+        # subsequent account read/order can fail. Remaining entries may be
+        # skipped after a crash, but aging/setups must never be applied twice.
+        for symbol, position in self.positions.items():
+            reason = position.pop('pending_exit', None)
+            if reason:
+                self.residual_exits.setdefault(symbol, {
+                    'reason': reason, 'bar_ms': entry_ms, 'attempt': 0,
+                    'cycle_ms': position['entry_ms']})
+        self.last_bar_ms = bar_ms
+        self._save()
+
         # 1. exits decided at this close, executed now at the new bar's open
         for symbol in list(self.positions):
-            reason = self.positions[symbol].pop('pending_exit', None)
-            if reason:
-                self._exit(symbol, reason, opens, entry_ms, out)
+            request = self.residual_exits.get(symbol)
+            if request:
+                self._exit(symbol, request['reason'], opens, request['bar_ms'], out)
 
         # 2. entries in canonical order, one at a time
         entry_block = (out.halted or margin.block_entries or not allow_entries
@@ -498,7 +629,7 @@ class Trader:
             req = self.pending.pop(symbol, None)
             if req is None or symbol in self.positions:
                 continue
-            if entry_block or self.halted or self.pending_operation is not None:
+            if entry_block or self.halted or self.pending_operation is not None or self.unresolved_operations:
                 out.skipped.append((symbol, 'entries blocked by guard'))
                 continue
             if symbol in blocked:
@@ -528,7 +659,7 @@ class Trader:
         self.last_bar_ms = bar_ms
 
         # 4. trailing stops move once per bar, monotonically
-        self._sync_protective_orders(out, entry_ms)
+        self._sync_protective_orders(out, entry_ms, state=state)
 
         if self.pending_operation is None:
             self.inflight_bar_ms = None
@@ -544,13 +675,20 @@ class Trader:
 
     def _exit(self, symbol: str, reason: str, opens: dict, bar_ms: int, out: BarOutcome) -> None:
         p = self.positions[symbol]
+        request = self.residual_exits.get(symbol, {})
+        if request.get('cycle_ms', p['entry_ms']) != p['entry_ms']:
+            self._halt(f'{symbol}: residual exit belongs to a different position cycle')
+            return
         market = self.markets[symbol]
         price = float(opens[symbol])
         attempt = self.residual_exits.get(symbol, {}).get('attempt', 0)
         coi = self._coi(bar_ms, symbol, f'EXIT_{reason}', seq=attempt)
         op = {'kind': 'exit', 'symbol': symbol, 'bar_ms': bar_ms, 'reason': reason,
               'coi': coi, 'qty': p['qty'], 'side': p['side'], 'attempt': attempt}
-        if self.pending_operation is not None:
+        self.residual_exits.setdefault(symbol, {'reason': reason, 'bar_ms': bar_ms,
+            'attempt': attempt, 'cycle_ms': p['entry_ms']})
+        self._save()
+        if self.pending_operation is not None or self._uncertain_market_order(symbol):
             out.reasons.append(f'{symbol}: exit waits for unresolved operation')
             return
         self._begin_operation(op)
@@ -562,9 +700,12 @@ class Trader:
             fill = self.broker.market_order(market, symbol, p['side'], p['qty'],
                                             closing=True, coi=coi, ref_price=price)
             self._finish_exit(op, fill, out)
+        except NotSubmitted as exc:
+            self._not_submitted(op, exc, out)
         except Exception as exc:
             self._needs_recovery = True
             self._halt(f'{symbol}: exit outcome unresolved: {exc}')
+            self._park_operation()
 
     def _finish_exit(self, op: dict, fill: Fill, out: BarOutcome) -> None:
         symbol = op['symbol']
@@ -573,7 +714,7 @@ class Trader:
         actual = state.positions.get(self.config_symbol_map[symbol])
         p = self.positions.get(symbol)
         if p is None:
-            if actual is not None or not state.execution_changes_verified:
+            if actual is not None or not self._symbol_verified(state, symbol):
                 raise RuntimeError('missing local close state requires reconciliation')
             self._cancel_protective(symbol, self.markets[symbol])
             self.orders.pop(symbol, None)
@@ -584,16 +725,17 @@ class Trader:
         if actual is not None and (actual['side'] != p['side'] or
                                    actual['qty'] > op['qty'] + 1e-12):
             raise RuntimeError('position changed unexpectedly during close')
-        if actual is None and fill.qty < op['qty'] - 1e-12 and not state.execution_changes_verified:
+        if actual is None and fill.qty < op['qty'] - 1e-12 and not self._symbol_verified(state, symbol):
             raise RuntimeError('flat account lacks evidence for the full close')
         if actual is not None:
             remaining = float(actual['qty'])
             if not math.isclose(op['qty'] - fill.qty, remaining, rel_tol=1e-9, abs_tol=1e-12):
-                if not state.execution_changes_verified:
+                if not self._symbol_verified(state, symbol):
                     raise RuntimeError('close fill and residual position disagree')
             p['qty'] = remaining
             self.residual_exits[symbol] = {
-                'reason': op['reason'], 'bar_ms': op['bar_ms'], 'attempt': op['attempt'] + 1}
+                'reason': op['reason'], 'bar_ms': op['bar_ms'], 'attempt': op['attempt'] + 1,
+                'cycle_ms': p['entry_ms']}
             out.reasons.append(f'{symbol}: close residual {remaining}; protection retained')
         else:
             self._cancel_protective(symbol, self.markets[symbol])
@@ -662,9 +804,12 @@ class Trader:
             fill = self.broker.market_order(market, symbol, side, plan.qty,
                                             closing=False, coi=coi, ref_price=plan.px)
             self._finish_entry(op, fill, out)
+        except NotSubmitted as exc:
+            self._not_submitted(op, exc, out)
         except Exception as exc:
             self._needs_recovery = True
             self._halt(f'{symbol}: entry/protection outcome unresolved: {exc}')
+            self._park_operation()
 
     def _finish_entry(self, op: dict, fill: Fill, out: BarOutcome, protect: bool = True) -> None:
         symbol = op['symbol']
@@ -739,27 +884,60 @@ class Trader:
                 self._halt(f'{symbol}: protective cancellation unresolved; new entries halted')
 
     def _sync_protective_orders(self, out: BarOutcome, bar_ms: int,
-                                fresh_symbols: set[str] | None = None) -> None:
+                                fresh_symbols: set[str] | None = None,
+                                allowed_symbols: set[str] | None = None, state=None) -> None:
         """Amend resting stops to this bar's trailed level.
 
-        Amend, never cancel-and-replace. And refuse any move that would loosen
+        Amend ordinary changes; renew expiry only after replacement is verified.
+        Refuse any move that would loosen
         the stop: live_core already guarantees monotonicity, so a loosening
         request here means state is wrong and the safe response is to skip it.
         """
         for symbol, p in self.positions.items():
             if self.pending_operation is not None:
                 return
+            if allowed_symbols is not None and symbol not in allowed_symbols:
+                continue
+            if self._uncertain_market_order(symbol):
+                continue
+            if any(op['symbol'] == symbol and op['kind'] == 'stop_renewal'
+                   for op in self.unresolved_operations.values()):
+                continue  # Only the durable renewal may change either stop ID.
             refs = self.orders.get(symbol) or {}
             sl = refs.get('SL')
+            if sl and hasattr(self.broker, 'engine'):
+                stored = self.broker.engine.store.load(sl['client_order_index'])
+                if stored and stored[1] and stored[1].get('order_expiry_ms') is not None:
+                    sl['order_expiry_ms'] = stored[1]['order_expiry_ms']
+                if not any(op['symbol'] == symbol for op in self.unresolved_operations.values()):
+                    try:
+                        if start_renewal(self, symbol, self._entry_now_ms(), out, state=state):
+                            self._park_operation()  # A healthy but incomplete renewal can wait for fresh evidence.
+                            continue
+                    except NotSubmitted as exc:
+                        if self.pending_operation is not None:
+                            self._not_submitted(self.pending_operation, exc, out)
+                        else:
+                            raise
+                        continue
+                    except Exception as exc:
+                        self._halt(f'{symbol}: stop renewal requires reconciliation: {exc}')
+                        self._park_operation()
+                        continue
             if not sl:
+                if any(op['symbol'] == symbol for op in self.unresolved_operations.values()):
+                    continue  # Recover the original protection ID; no replacement guess.
                 if fresh_symbols is not None and symbol not in fresh_symbols:
                     out.reasons.append(f'{symbol}: missing stop awaits fresh mark; entries blocked')
                     continue
                 try:
                     self._place_protective(symbol, bar_ms)
+                except NotSubmitted as exc:
+                    self._not_submitted(self.pending_operation, exc, out)
                 except Exception as exc:
                     self._needs_recovery = True
                     self._halt(f'{symbol}: protective placement unresolved: {exc}')
+                    self._park_operation()
                 continue
             placed = sl.get('trigger')
             if placed is not None:
@@ -772,6 +950,9 @@ class Trader:
                         and math.isclose(p['qty'], sl['qty'], rel_tol=1e-9, abs_tol=1e-12)):
                     continue
             try:
+                if any(op['symbol'] == symbol and op['kind'] == 'amend'
+                       for op in self.unresolved_operations.values()):
+                    continue
                 self._begin_operation({'kind': 'amend', 'symbol': symbol, 'bar_ms': bar_ms,
                                        'coi': sl['client_order_index'], 'qty': p['qty'],
                                        'trigger': p['stop']})
@@ -782,9 +963,12 @@ class Trader:
                 self.pending_operation = None
                 self._save()
                 self.journal.append('stop_amended', bar_ms=bar_ms, symbol=symbol, stop=p['stop'])
+            except NotSubmitted as exc:
+                self._not_submitted(self.pending_operation, exc, out)
             except Exception as exc:
                 self._needs_recovery = True
                 self._halt(f'{symbol}: stop amendment outcome unresolved: {exc}')
                 out.reasons.append(f'{symbol}: stop amend failed ({exc}); protection requires verification')
                 self.journal.append('stop_amend_failed', bar_ms=bar_ms, symbol=symbol,
                                     error=str(exc))
+                self._park_operation()

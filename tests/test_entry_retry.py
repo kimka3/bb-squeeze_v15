@@ -206,12 +206,14 @@ def test_runner_services_protection_then_retries_before_next_regular_poll(tmp_pa
 def test_budget_delay_after_nonce_still_cannot_send_expired_entry(monkeypatch):
     from types import SimpleNamespace
     from live.authenticated import LighterTransport
+    from live.execution_evidence import NotSubmitted
     stamp=[.9]; observed=[]
     class Budget:
         def check(self,**kw):stamp[0]=1.001
     t=LighterTransport.__new__(LighterTransport);t.budget=Budget()
     monkeypatch.setattr('live.authenticated.time.time',lambda:stamp[0])
     async def transaction():observed.append('sent')
-    with pytest.raises(RuntimeError,match='requires reconciliation'):
+    with pytest.raises(NotSubmitted) as caught:
         t._send(transaction(),deadline_ms=1000)
+    assert caught.value.reason == 'entry_deadline_elapsed'
     assert observed==[]

@@ -44,6 +44,8 @@ from live import feed                                              # noqa: E402
 from live import observation                                       # noqa: E402
 from live.runtime_health import RuntimeHealth                      # noqa: E402
 from live.strategy_broker import StrategyBroker                    # noqa: E402
+from live.authenticated import is_transient_read_error              # noqa: E402
+from live.request_budget import RequestDeferred                    # noqa: E402
 
 STOP_REQUESTED = threading.Event()
 
@@ -346,6 +348,57 @@ def parse_until(text: str) -> float:
     return t.timestamp()
 
 
+def handle_entry_retry_failure(trader, exc, coverage, counters, *, now_ms=None):
+    """Discard failed candidates without confusing reads with unknown orders.
+
+    Retry-read failures use the existing service coverage stream, so a normal
+    protection/account service closes that gap. API budget waiting alone is
+    not an exchange outage and never resets exchange recovery here.
+    """
+    now_ms = int(time.time()*1000) if now_ms is None else int(now_ms)
+    batch = getattr(trader, 'deferred_entries', None)
+    unresolved = bool(getattr(trader, 'pending_operation', None)
+                      or getattr(trader, 'unresolved_operations', {}))
+    if isinstance(exc, RequestDeferred) and not unresolved:
+        counters['entry_retry_budget_deferrals'] = counters.get('entry_retry_budget_deferrals', 0) + 1
+        counters['last_entry_retry_budget_wait_ms'] = now_ms
+        guard = getattr(trader.broker, 'entry_guard', None)
+        permitted = (batch is not None and batch['bar_ms']+H4 <= now_ms < batch['deadline_ms']
+                     and not getattr(trader, 'halted', False) and not getattr(trader, 'data_gaps', [])
+                     and (guard is None or guard()))
+        if permitted:
+            trader._defer_entries(batch['bar_ms'], batch['rows'], batch['requests'], exc)
+        else:
+            trader.deferred_entries = None
+            if batch:
+                trader.journal.append('entry_deferred_discarded', bar_ms=batch['bar_ms'],
+                    symbols=list(batch['requests']), reason='budget wait outside original entry window or guard')
+        trader.journal.append('entry_retry_budget_wait', retry_after=exc.retry_after,
+                             candidate_retained=bool(permitted))
+        return
+
+    # Clear the candidate before any other handler can fail; it may not be
+    # replayed after the recovery gate or across its original deadline.
+    trader.deferred_entries = None
+    recovery = getattr(trader, 'exchange_recovery', None)
+    if recovery is not None and not isinstance(exc, RequestDeferred):
+        recovery.failure(exc, 'entry_retry')
+    counters['entry_retry_errors'] = counters.get('entry_retry_errors', 0) + 1
+    counters['service_errors'] = counters.get('service_errors', 0) + 1
+    counters['last_entry_retry_failure_ms'] = now_ms
+    counters['last_error'] = f'entry_retry: {exc}'
+    if batch:
+        trader.journal.append('entry_deferred_discarded', bar_ms=batch['bar_ms'],
+                             symbols=list(batch['requests']), reason='entry retry failure')
+    trader.journal.append('service_error', source='entry_retry', error=str(exc))
+    if coverage is not None:
+        coverage.failure('service', now_ms, str(exc))
+    if not (is_transient_read_error(exc) and recovery is not None and not unresolved):
+        # Missing recovery infrastructure, unknown execution and nontransient
+        # identity/TLS/schema/storage failures remain explicit safety halts.
+        trader._halt(f'deferred entry reconciliation failed: {exc}')
+
+
 def persist_report(trader, config, coverage=None, **health) -> None:
     now_ms = int(time.time() * 1000)
     entry_guard=getattr(trader.broker,'entry_guard',None)
@@ -377,6 +430,7 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         atomic_json(config.state_dir/'report.json',{
             **trader.broker.last_report,'updated_ms':now_ms,'classification':'authenticated_account_ledger',
             'strategy_data_gaps':trader.data_gaps,'runtime_coverage':runtime_coverage,
+            'unresolved_operations':getattr(trader, 'unresolved_operations', {}),
             'trader_halted':trader.halted,'halt_reasons':trader.halt_reasons,'performance_complete':False})
     atomic_json(config.state_dir / 'runner_status.json', {
         'updated_ms': now_ms, 'pid': os.getpid(), 'mode': config.mode,
@@ -384,6 +438,7 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         'halted': bool(getattr(trader, 'halt_reason', None) or getattr(trader, 'halted', False)),
         'halt_reasons': list(getattr(trader, 'halt_reasons', [])),
         'pending_operation': getattr(trader, 'pending_operation', None),
+        'unresolved_operations': getattr(trader, 'unresolved_operations', {}),
         'residual_exits': getattr(trader, 'residual_exits', {}),
         'orphan_orders': getattr(trader, 'orphan_orders', {}),
         'api_read_diagnostics_error': getattr(getattr(trader.broker, 'transport', None),
@@ -408,6 +463,8 @@ def run_loop(trader, markets, config, deadline: float) -> None:
     next_bar_at = next_poll_at = next_sample_at = time.time()
     counters = {'poll_errors': 0, 'bar_errors': 0, 'observation_errors': 0,
                 'service_errors': 0,'last_successful_service_ms': None,
+                 'entry_retry_errors': 0, 'entry_retry_budget_deferrals': 0,
+                 'last_entry_retry_failure_ms': None, 'last_entry_retry_budget_wait_ms': None,
                 'successful_polls': 0, 'observations': 0, 'last_error': None,
                 'last_successful_poll_ms': None, 'last_bar_success_ms': None,
                 'last_observation_ms': None}
@@ -500,10 +557,7 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                 try:
                     trader.retry_deferred_entries()
                 except Exception as exc:
-                    # An unknown read/order outcome is never a retryable new
-                    # candidate. Existing protection/recovery continues below.
-                    trader.deferred_entries = None
-                    trader._halt(f'deferred entry reconciliation failed: {exc}')
+                    handle_entry_retry_failure(trader, exc, coverage, counters)
                 persist_report(trader, config, coverage=coverage, **counters)
             now = time.time()
             if now >= deadline or STOP_REQUESTED.is_set():

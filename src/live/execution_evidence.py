@@ -17,6 +17,21 @@ class UnverifiedExecution(RuntimeError):
     pass
 
 
+class NotSubmitted(UnverifiedExecution):
+    """Positive local evidence that this attempt never entered dispatch.
+
+    This is not inferred from an absent order or a timeout. ``reason`` is a
+    fixed diagnostic code, never a response body; ``cause`` retains the typed
+    local failure so callers cannot silently weaken a safety halt.
+    """
+    def __init__(self, reason, *, retryable=False, cause=None):
+        self.reason = str(reason)
+        self.retryable = bool(retryable)
+        self.cause = cause
+        self.retry_after = getattr(cause, 'retry_after', None)
+        super().__init__(f'transaction not submitted: {self.reason.replace("_", " ")}')
+
+
 def number(value) -> Decimal:
     if isinstance(value, bool) or value is None:
         raise UnverifiedExecution('missing or boolean numeric field')
@@ -104,11 +119,15 @@ def verify_order(row: dict, intent: Intent) -> dict:
         raise UnverifiedExecution('filled status with inconsistent quantity')
     if status in {'open', 'pending', 'in-progress'} and qty + remaining != initial:
         raise UnverifiedExecution('active order quantities do not balance')
+    expiry = row.get('order_expiry')
+    if expiry is not None and (type(expiry) is not int or expiry < 0):
+        raise UnverifiedExecution('invalid order expiry milliseconds')
     return {'order_index': row['order_index'], 'status': status,
             'terminal': status in TERMINAL, 'filled_qty': str(qty),
             'filled_quote': str(quote), 'remaining_qty': str(remaining),
             'average_price': str(quote / qty) if qty else None,
-            'fees_verified': False, 'position_verified': False}
+            'fees_verified': False, 'position_verified': False,
+            'order_expiry_ms': expiry if expiry else None}
 
 
 def verify_stop(row: dict, intent: Intent, position_quantity: str) -> dict:
@@ -144,6 +163,10 @@ class IntentStore:
         self.db.execute('PRAGMA synchronous=FULL')
         self.db.execute('CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY, value TEXT NOT NULL)')
         self.db.execute('CREATE TABLE IF NOT EXISTS intents (coi TEXT PRIMARY KEY, intent TEXT NOT NULL, result TEXT)')
+        # Keep the original intent schema and load() contract intact. A legacy
+        # intent without this metadata is UNKNOWN, never known-not-submitted.
+        self.db.execute('CREATE TABLE IF NOT EXISTS intent_dispatch '
+                        '(coi TEXT PRIMARY KEY, state TEXT NOT NULL, reason TEXT, retryable INTEGER NOT NULL)')
         identity = json.dumps([network, account_index])
         try:
             with self.db:
@@ -165,6 +188,8 @@ class IntentStore:
             with self.db:
                 self.db.execute('INSERT INTO intents VALUES (?, ?, NULL)',
                                 (str(intent.client_order_index), json.dumps(asdict(intent), sort_keys=True)))
+                self.db.execute('INSERT INTO intent_dispatch VALUES (?, ?, NULL, 0)',
+                                (str(intent.client_order_index), 'reserved'))
         except sqlite3.IntegrityError as exc:
             raise UnverifiedExecution('intent already reserved; reconcile instead of resending') from exc
 
@@ -174,17 +199,70 @@ class IntentStore:
             found = self.db.execute('SELECT intent, result FROM intents WHERE coi=?', (str(coi),)).fetchone()
             if not found:
                 raise UnverifiedExecution('unknown local intent')
+            if self.known_not_submitted(coi):
+                raise UnverifiedExecution('exchange order conflicts with confirmed local non-submission')
             result = verify_order(row, Intent(**json.loads(found[0])))
             if found[1]:
                 previous = json.loads(found[1])
+                # Older terminal results predate expiry capture. Adding observed
+                # metadata is not a regression in their immutable fill evidence.
+                comparison, previous_comparison = dict(result), dict(previous)
+                if previous.get('order_expiry_ms') is None:
+                    comparison.pop('order_expiry_ms', None)
+                    previous_comparison.pop('order_expiry_ms', None)
                 if (result['order_index'] != previous['order_index'] or
                         number(result['filled_qty']) < number(previous['filled_qty']) or
                         number(result['filled_quote']) < number(previous['filled_quote']) or
-                        (previous['terminal'] and result != previous)):
+                        (previous['terminal'] and comparison != previous_comparison)):
                     raise UnverifiedExecution('regressed or conflicting exchange evidence')
             self.db.execute('UPDATE intents SET result=? WHERE coi=?',
                             (json.dumps(result), str(coi)))
+            self.db.execute('INSERT INTO intent_dispatch VALUES (?, ?, NULL, 0) '
+                            'ON CONFLICT(coi) DO UPDATE SET state=excluded.state, reason=NULL, retryable=0',
+                            (str(coi), 'evidenced'))
         return result
+
+    def submission_details(self, coi: int):
+        row = self.db.execute('SELECT d.state,d.reason,d.retryable FROM intents i '
+            'LEFT JOIN intent_dispatch d ON d.coi=i.coi WHERE i.coi=?', (str(coi),)).fetchone()
+        if row is None:
+            return None
+        return {'state': row[0] or 'unknown', 'reason': row[1], 'retryable': bool(row[2])}
+
+    def submission_state(self, coi: int):
+        details = self.submission_details(coi)
+        return details['state'] if details else None
+
+    def known_not_submitted(self, coi: int) -> bool:
+        return self.submission_state(coi) == 'not_submitted'
+
+    def mark_dispatching(self, coi: int) -> None:
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.db.execute('SELECT result FROM intents WHERE coi=?', (str(coi),)).fetchone()
+            if (row is None or row[0] is not None or
+                    self.submission_state(coi) not in ('reserved', 'not_submitted')):
+                raise UnverifiedExecution('dispatch requires an unused locally reserved intent')
+            self.db.execute('UPDATE intent_dispatch SET state=?,reason=NULL,retryable=0 WHERE coi=?',
+                            ('dispatching', str(coi)))
+
+    def mark_not_submitted(self, coi: int, error: NotSubmitted) -> None:
+        if type(error) is not NotSubmitted:
+            raise TypeError('only typed pre-dispatch evidence can prove non-submission')
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.db.execute('SELECT result FROM intents WHERE coi=?', (str(coi),)).fetchone()
+            if row is None or row[0] is not None or self.submission_state(coi) != 'dispatching':
+                raise UnverifiedExecution('non-submission conflicts with existing dispatch evidence')
+            self.db.execute('UPDATE intent_dispatch SET state=?,reason=?,retryable=? WHERE coi=?',
+                            ('not_submitted', error.reason, int(error.retryable), str(coi)))
+
+    def mark_acknowledged(self, coi: int) -> None:
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            if self.submission_state(coi) != 'dispatching':
+                raise UnverifiedExecution('acknowledgement without pending dispatch')
+            self.db.execute('UPDATE intent_dispatch SET state=? WHERE coi=?', ('acknowledged', str(coi)))
 
     def terminal_result(self, coi: int) -> dict | None:
         row = self.db.execute('SELECT result FROM intents WHERE coi=?', (str(coi),)).fetchone()
