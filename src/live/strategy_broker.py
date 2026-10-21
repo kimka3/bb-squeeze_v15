@@ -62,6 +62,31 @@ class StrategyBroker:
         if not matches: raise UnverifiedExecution('no owned entry cycle')
         return matches[-1]
 
+    def _superseded_stops(self, bindings):
+        """Validate durable non-dispatch retirement without rewriting old orders."""
+        links = self.engine.store.supersessions()
+        for old_coi, link in links.items():
+            new_coi, proof = link['new_coi'], link['proof']
+            old, new = bindings.get(old_coi), bindings.get(new_coi)
+            before, after = self.engine.store.load(old_coi), self.engine.store.load(new_coi)
+            if (not old or not new or not before or not after
+                    or old != new or old['role'] != 'SL'
+                    or proof.get('kind') != 'stop_renewal'
+                    or proof.get('symbol') != old['symbol'] or proof.get('side') != old['side']
+                    or proof.get('entry_cycle') != old['cycle']
+                    or type(proof.get('cycle_ms')) is not int
+                    or not self.engine.store.known_not_submitted(old_coi)):
+                raise UnverifiedExecution('stop supersession lacks owned non-dispatch evidence')
+            old_protection = bindings.get(proof.get('old_protection_coi'))
+            if old_protection != old:
+                raise UnverifiedExecution('stop supersession protection cycle differs')
+            for coi, stored in ((old_coi, before), (new_coi, after)):
+                intent = stored[0]
+                self._check_call_identity(self.markets[old['symbol']], old['symbol'], old['side'], coi, 'SL')
+                if not intent.reduce_only or intent.order_type != 'stop-loss':
+                    raise UnverifiedExecution('stop supersession is not reduce-only protection')
+        return links
+
     def _bind(self,coi,symbol,side,role):
         if type(coi) is not int or not 0<=coi<2**48:
             raise ValueError('Lighter client order index must fit 48 bits')
@@ -363,6 +388,7 @@ class StrategyBroker:
                 raise UnverifiedExecution('active order identity missing or duplicated')
             active_by_coi[coi]=row
         bindings=self._bindings(); results={}; intents={}; expected={}; tp_done={}; costs={}
+        superseded = self._superseded_stops(bindings)
         unresolved={}; not_submitted={}; unverified_markets=set(); read_mismatches=set()
         unknown_ownership=False
         publication_evidence=[]; hard_markets=set(); cycle_exposure={}
@@ -389,6 +415,8 @@ class StrategyBroker:
                     raise UnverifiedExecution('exchange order conflicts with confirmed local non-submission')
                 detail=self.engine.store.submission_details(coi)
                 not_submitted[str(coi)]=diagnostic(coi,detail['reason'],retryable=detail['retryable'])
+                if coi in superseded:
+                    not_submitted[str(coi)]['superseded_by'] = superseded[coi]['new_coi']
                 continue
             if row is not None:
                 result=self.engine.store.record(coi,row)
@@ -428,6 +456,20 @@ class StrategyBroker:
                 unresolved[str(coi)]=diagnostic(coi,'cancel_outcome_unconfirmed')
         self.ledger.collect(self.transport,int(self.clock()*1000))
         report=self.ledger.report()
+        # Unsupported, structurally valid history is retained separately. It
+        # never authorizes new entries or management of its affected market.
+        # Other markets still need exact owned order/history/account evidence.
+        historical_issues = report.get('historical_issues', [])
+        historical_blocked = report.get('historical_evidence_complete', True) is not True or bool(historical_issues)
+        if not isinstance(historical_issues, list):
+            raise UnverifiedExecution('invalid historical issue diagnostics')
+        for issue in historical_issues:
+            if not isinstance(issue, dict) or type(issue.get('market_id')) is not int or issue['market_id'] < 0:
+                raise UnverifiedExecution('unsupported history lacks a trustworthy market identity')
+            hard_markets.add(issue['market_id'])
+            unverified_markets.add(issue['market_id'])
+        if historical_blocked and not historical_issues:
+            raise UnverifiedExecution('historical evidence blocked without scoped diagnostics')
         trades=self.ledger.events('trade')
         grouped={}
         for trade in trades:
@@ -558,7 +600,24 @@ class StrategyBroker:
             out[m.symbol]={'side':'LONG' if p>0 else 'SHORT','qty':float(abs(p)),'entry':float(number(raw['avg_entry_price'])),
                            'partial_taken':tp_done.get(cycle,False)}
         verified_symbols=sorted(m.symbol for _,m in self.by_id.values() if m.market_id not in unverified_markets)
+        covered_unsent_stops = {}
+        for coi, item in not_submitted.items():
+            if item['role'] != 'SL' or item.get('superseded_by') is not None or not item['retryable']:
+                continue
+            intent = intents[int(coi)]
+            market = self.markets[item['symbol']]
+            qty = abs(actual.get(intent.market_index, Decimal(0)))
+            # A known-unsent renewal does not remove an existing native stop.
+            # Verify an armed stop in the SAME owned cycle covering the whole
+            # remaining position; a different/expired/partial stop cannot help.
+            covering = [row['client_order_index'] for row in active_map.get(market.symbol, [])
+                        if row['client_order_index'] != int(coi) and row['purpose'] == 'SL'
+                        and row['armed'] and number(row['qty']) >= qty > 0
+                        and bindings[row['client_order_index']] == bindings[int(coi)]]
+            if covering:
+                covered_unsent_stops[coi] = covering
         pending_protection=any(item['role'] in ('SL','TP') and actual.get(intents[int(coi)].market_index)
+                               and item.get('superseded_by') is None and coi not in covered_unsent_stops
                                for coi,item in not_submitted.items())
         head_complete=report.get('history_collection',{}).get('head_complete',True)
         if not head_complete:
@@ -566,18 +625,20 @@ class StrategyBroker:
                 'pending_reason':report.get('history_collection',{}).get('pending_reason')})
         publication_pending=(bool(publication_evidence or not head_complete) and not hard_markets
                              and not unknown_ownership and not unresolved and not pending_protection
-                             and not unsafe_protection)
+                             and not unsafe_protection and not historical_blocked)
         verified=(not unresolved and not unverified_markets and not pending_protection
-                  and not unsafe_protection and head_complete)
+                  and not unsafe_protection and head_complete and not historical_blocked)
         report.update(order_roles=costs,execution_changes_verified=verified,
                       unresolved_orders=unresolved,not_submitted_orders=not_submitted,
+                      superseded_stop_orders={str(k): v for k, v in superseded.items()},
+                      covered_not_submitted_stops=covered_unsent_stops,
                       unsafe_protection=unsafe_protection,
                       verified_symbols=verified_symbols,
                       risk_verified_symbols=risk_verified_symbols,
                       publication_pending=publication_pending,
                       publication_pending_reason=('owned_trade_details_pending' if read_mismatches else 'history_head_backlog') if publication_pending else None,
                       publication_pending_evidence=publication_evidence,
-                      owned_exposure_matches_account=not hard_markets and not unknown_ownership and not unresolved,
+                      owned_exposure_matches_account=not hard_markets and not unknown_ownership and not unresolved and not historical_blocked,
                       funding_attributions=self.ledger.attribute_funding(bindings),
                       funding_scope='settled account cash changes attributed to owned holding intervals')
         equity=number(account['total_asset_value'])
@@ -602,8 +663,18 @@ class StrategyBroker:
             report.update(actual_account_equity=str(equity),allocated_equity=str(min(equity,allocated)),
                           allocation_scope='initial approved equity plus owned trading and settled funding; capped by actual equity')
             equity=min(equity,allocated)
+            if historical_blocked:
+                # Unsupported cash/position events cannot be converted into a
+                # fabricated realized loss or a certified allocation. Fresh
+                # account equity, capped at approved starting capital, is used
+                # only for protection diagnostics while ALL entries are off.
+                actual_equity = number(account['total_asset_value'])
+                equity = min(actual_equity, number(self.initial_allocated_equity))
+                report.update(allocated_equity=None, risk_evaluation_equity=str(equity),
+                              allocation_scope='unverified due to quarantined history; new entries blocked',
+                              risk_equity_source='fresh account equity capped at approved initial capital; protection only')
         candidate=(bool(read_mismatches) and not unknown_ownership and not unresolved
-                   and unverified_markets<=read_mismatches)
+                   and unverified_markets<=read_mismatches and not historical_blocked)
         return (AccountState(float(equity),float(maintenance),out,active_map,
                              verified,True,report),candidate)
 

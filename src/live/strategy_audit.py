@@ -48,6 +48,7 @@ def audit(transport,sessions,output,*,clock=time.time):
         result={**ledger_report,'account_index':transport.account_index,'checked_at_ms':int(clock()*1000),
             'order_comparisons':evidence,'unowned_trade_ids':unowned,
             'all_order_fills_match':(all(e['matches'] for e in evidence) and not unowned
+                and ledger_report.get('historical_evidence_complete', True) and not ledger_report.get('historical_issues')
                 and ledger_report.get('history_collection',{}).get('head_complete',False)
                 and (ledger_report.get('history_collection',{}).get('full_audit_complete_through_ms') or 0)>=collected_through_ms),
             'open_position_count':len(positions(account)),'active_order_count':len(active),

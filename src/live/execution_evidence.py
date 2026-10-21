@@ -167,6 +167,8 @@ class IntentStore:
         # intent without this metadata is UNKNOWN, never known-not-submitted.
         self.db.execute('CREATE TABLE IF NOT EXISTS intent_dispatch '
                         '(coi TEXT PRIMARY KEY, state TEXT NOT NULL, reason TEXT, retryable INTEGER NOT NULL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS intent_supersessions '
+                        '(old_coi TEXT PRIMARY KEY, new_coi TEXT UNIQUE NOT NULL, proof TEXT NOT NULL)')
         identity = json.dumps([network, account_index])
         try:
             with self.db:
@@ -236,12 +238,70 @@ class IntentStore:
     def known_not_submitted(self, coi: int) -> bool:
         return self.submission_state(coi) == 'not_submitted'
 
+    def supersessions(self):
+        return {int(old): {'new_coi': int(new), 'proof': json.loads(proof)}
+                for old, new, proof in self.db.execute(
+                    'SELECT old_coi,new_coi,proof FROM intent_supersessions ORDER BY rowid')}
+
+    def supersede_not_submitted(self, old_coi: int, replacement: Intent, proof: dict) -> None:
+        """Reserve a new stop ID and its non-dispatch provenance atomically.
+
+        Never rewrite the original order or manufacture terminal evidence. A
+        crash after this transaction leaves the replacement positively unsent
+        until mark_dispatching() changes that evidence before the actual send.
+        """
+        if (type(old_coi) is not int or not isinstance(proof, dict)
+                or proof.get('kind') != 'stop_renewal'
+                or not isinstance(proof.get('symbol'), str)
+                or proof.get('side') not in ('LONG', 'SHORT')
+                or any(type(proof.get(k)) is not int or proof[k] < 0
+                       for k in ('entry_cycle', 'cycle_ms', 'old_protection_coi', 'created_ms'))):
+            raise UnverifiedExecution('invalid stop supersession proof')
+        encoded_proof = json.dumps(proof, sort_keys=True, allow_nan=False)
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            old = self.load(old_coi)
+            details = self.submission_details(old_coi)
+            if (old is None or old[1] is not None or details is None
+                    or details['state'] != 'not_submitted' or not details['retryable']):
+                raise UnverifiedExecution('supersession requires retryable confirmed non-submission')
+            original = old[0]
+            if (replacement.client_order_index in (old_coi, proof['old_protection_coi'])
+                    or not 0 <= replacement.client_order_index < 2**48
+                    or replacement.account_index != self.account_index
+                    or any(getattr(original, name) != getattr(replacement, name)
+                           for name in ('account_index', 'market_index', 'is_ask', 'reduce_only',
+                                        'order_type', 'time_in_force'))
+                    or not original.reduce_only or original.order_type != 'stop-loss'
+                    or original.time_in_force != 'immediate-or-cancel'
+                    or original.is_ask != (proof['side'] == 'LONG')
+                    or number(replacement.quantity) > number(original.quantity)
+                    or (original.is_ask and number(replacement.trigger_price) < number(original.trigger_price))
+                    or (not original.is_ask and number(replacement.trigger_price) > number(original.trigger_price))):
+                raise UnverifiedExecution('stop supersession changes identity or loosens protection')
+            prior = self.supersessions().get(old_coi)
+            if prior is not None:
+                if (prior != {'new_coi': replacement.client_order_index, 'proof': proof}
+                        or self.load(replacement.client_order_index) is None
+                        or self.load(replacement.client_order_index)[0] != replacement):
+                    raise UnverifiedExecution('stop supersession identity changed')
+                return
+            if self.load(replacement.client_order_index) is not None:
+                raise UnverifiedExecution('stop supersession replacement ID already reserved')
+            self.db.execute('INSERT INTO intents VALUES (?, ?, NULL)',
+                (str(replacement.client_order_index), json.dumps(asdict(replacement), sort_keys=True)))
+            self.db.execute('INSERT INTO intent_dispatch VALUES (?, ?, ?, 1)',
+                (str(replacement.client_order_index), 'not_submitted', 'renewal_supersession_reserved'))
+            self.db.execute('INSERT INTO intent_supersessions VALUES (?, ?, ?)',
+                (str(old_coi), str(replacement.client_order_index), encoded_proof))
+
     def mark_dispatching(self, coi: int) -> None:
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
             row = self.db.execute('SELECT result FROM intents WHERE coi=?', (str(coi),)).fetchone()
             if (row is None or row[0] is not None or
-                    self.submission_state(coi) not in ('reserved', 'not_submitted')):
+                    self.submission_state(coi) not in ('reserved', 'not_submitted') or
+                    coi in self.supersessions()):
                 raise UnverifiedExecution('dispatch requires an unused locally reserved intent')
             self.db.execute('UPDATE intent_dispatch SET state=?,reason=NULL,retryable=0 WHERE coi=?',
                             ('dispatching', str(coi)))

@@ -35,5 +35,6 @@ def test_single_pass_matches_original_with_ties_multiple_cycles_and_unknown_owne
         calls.append(kind)
         return trades if kind=='trade' else fundings
     ledger.events=events
+    ledger.historical_issues=lambda: []
     assert ledger.attribute_funding(bindings)==original_attribution(trades,fundings,bindings)
     assert calls==['funding','trade']

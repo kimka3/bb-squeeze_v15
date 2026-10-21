@@ -219,6 +219,30 @@ class Trader:
                 self.config_symbol_map[symbol] in state.ledger_report.get('verified_symbols', []) or
                 self.config_symbol_map[symbol] in state.ledger_report.get('risk_verified_symbols', []))
 
+    def _history_quarantined_symbols(self, state=None):
+        report = state.ledger_report if state is not None else getattr(self.broker, 'last_report', {})
+        markets = {item['market_id'] for item in report.get('historical_issues', [])}
+        return {symbol for symbol, market in self.markets.items() if market.market_id in markets}
+
+    def _initial_stop_waits_for_dispatch(self, symbol, sl, unsent):
+        pending_ids = {int(coi) for coi, item in unsent.items()
+                       if item.get('symbol') == symbol and item.get('role') == 'SL'
+                       and item.get('retryable') and item.get('superseded_by') is None}
+        if sl is not None:
+            return sl['client_order_index'] in pending_ids
+        # A renewal replacement that has never been sent cannot excuse loss of
+        # the old native stop. With no current SL reference, only the exact ID
+        # of a durable INITIAL protection operation may await a safe retry.
+        operations = list(self.unresolved_operations.values())
+        if self.pending_operation is not None:
+            operations.append(self.pending_operation)
+        return any(op['symbol'] == symbol
+                   and (op['kind'] == 'protection' or
+                        (op['kind'] == 'entry' and op.get('phase') == 'protect'))
+                   and self._coi(op['bar_ms'], symbol, 'SL',
+                                 seq=self.protection_generation.get(symbol, 0)) in pending_ids
+                   for op in operations)
+
     def observe_publication(self, report):
         """Record strictly classified detail-history lag without clearing HALT.
 
@@ -304,7 +328,11 @@ class Trader:
         """Apply ledger-confirmed changes; a smaller position is not TP proof."""
         notes = []
         pending = self.observe_publication(state.ledger_report)
-        if state.ledger_report and not state.execution_changes_verified and not pending:
+        historical_issues = state.ledger_report.get('historical_issues', [])
+        if historical_issues:
+            markets = sorted({item['market_id'] for item in historical_issues})
+            self._halt(f'unsupported history requires manual reconciliation; affected markets: {markets}')
+        elif state.ledger_report and not state.execution_changes_verified and not pending:
             self._halt('account execution history does not reconcile; new entries halted')
         reverse = {v: k for k, v in self.config_symbol_map.items()}
         live = {}
@@ -359,6 +387,9 @@ class Trader:
         out = BarOutcome(now_ms, initial_state.equity)
         state_may_change = bool(self.orphan_orders or self._needs_recovery or self.unresolved_operations)
         for symbol, refs in list(self.orphan_orders.items()):
+            if symbol in self._history_quarantined_symbols(initial_state):
+                out.reasons.append(f'{symbol}: orphan cancellation deferred; history quarantined')
+                continue
             unresolved = {}
             for purpose, ref in refs.items():
                 try:
@@ -378,7 +409,7 @@ class Trader:
                 self.pending_operation = self.unresolved_operations.pop(key)
                 self._save()
                 try:
-                    self._recover_operation(out, fresh_symbols)
+                    self._recover_operation(out, fresh_symbols, state=initial_state)
                 finally:
                     self._park_operation()
             if self.pending_operation is None:
@@ -426,8 +457,7 @@ class Trader:
                         # durable operation for late evidence and close only
                         # the independently reconciled exposure below.
                         unsent = state.ledger_report.get('not_submitted_orders', {})
-                        if any(v.get('symbol') == symbol and v.get('role') == 'SL'
-                               and v.get('retryable') for v in unsent.values()):
+                        if self._initial_stop_waits_for_dispatch(symbol, sl, unsent):
                             continue
                         self._halt(f'{symbol}: protective stop missing; entries halted')
                         if sl:
@@ -458,9 +488,12 @@ class Trader:
         self._save()
         return out
 
-    def _recover_operation(self, out: BarOutcome, fresh_symbols: set[str]) -> None:
+    def _recover_operation(self, out: BarOutcome, fresh_symbols: set[str], state=None) -> None:
         op = self.pending_operation
         if op is None:
+            return
+        if op['symbol'] in self._history_quarantined_symbols(state):
+            out.reasons.append(f'{op["symbol"]}: operation recovery deferred; history quarantined')
             return
         try:
             if op['kind'] == 'stop_renewal':
@@ -602,8 +635,13 @@ class Trader:
             self.journal.append('bar_skipped', bar_ms=bar_ms, reasons=fresh.reasons)
             return out
 
+        quarantine_active = bool(state.ledger_report.get('historical_issues'))
+        quarantined_symbols = self._history_quarantined_symbols(state)
         held_at = getattr(self.broker, 'held_symbols_at', None)
-        held_at_close = held_at(entry_ms) if held_at is not None else set(self.positions)
+        # Quarantine already blocks every entry. Do not require an unsupported
+        # holding path merely to manage independently verified open positions.
+        held_at_close = (held_at(entry_ms) if held_at is not None and not quarantine_active
+                         else set(self.positions))
         out.reasons += self._sync_fills(state)
 
         mismatch = guards.reconcile(self.positions, state, self.config_symbol_map)
@@ -613,7 +651,21 @@ class Trader:
             self.journal.append('reconcile_halt', bar_ms=bar_ms, reasons=mismatch.reasons)
             for reason in mismatch.reasons:
                 self._halt(reason)
-            return out
+            if not quarantine_active:
+                return out
+
+        bar_symbols = set(self.positions)
+        if quarantine_active:
+            # Unknown reductions stay frozen, including their bar age and stop
+            # path. Other markets need exact fresh owned exposure; a global
+            # HALT alone must not suppress their existing close rules.
+            bar_symbols = {symbol for symbol, position in self.positions.items()
+                           if symbol not in quarantined_symbols and self._symbol_verified(state, symbol)
+                           and not self._uncertain_market_order(symbol)
+                           and (actual := state.positions.get(self.config_symbol_map[symbol])) is not None
+                           and actual['side'] == position['side']
+                           and math.isclose(float(actual['qty']), float(position['qty']),
+                                            rel_tol=1e-9, abs_tol=1e-12)}
 
         self.inflight_bar_ms = bar_ms
         self._save()
@@ -630,18 +682,20 @@ class Trader:
 
         # A position held through the closed bar ages by one bar before the close
         # rules run, matching the backtest's ordering.
-        for p in self.positions.values():
-            p['bars'] += 1
+        for symbol in bar_symbols:
+            self.positions[symbol]['bars'] += 1
 
         for symbol, p in self.positions.items():
-            update_on_bar_close(p, rows[symbol], self.cfg)
+            if symbol in bar_symbols:
+                update_on_bar_close(p, rows[symbol], self.cfg)
 
         # Signals come from the bar that just closed and are acted on at the
         # open now forming — the backtest's close(i-1) -> open(i) ordering.
         # Scanning BEFORE the exits matters: a symbol still held at that close
         # is skipped, exactly as the backtest skips it.
         # pending is derived fresh every bar, never carried across a restart.
-        self.pending, filtered = scan_signals(bar_ms, rows, self.universe, self.longs,
+        signal_universe = [symbol for symbol in self.universe if symbol not in quarantined_symbols]
+        self.pending, filtered = scan_signals(bar_ms, rows, signal_universe, self.longs,
                                               {**{s: {} for s in held_at_close}, **self.positions},
                                               self.setups, self.cfg)
 
@@ -657,6 +711,8 @@ class Trader:
         # subsequent account read/order can fail. Remaining entries may be
         # skipped after a crash, but aging/setups must never be applied twice.
         for symbol, position in self.positions.items():
+            if symbol not in bar_symbols:
+                continue
             reason = position.pop('pending_exit', None)
             if reason:
                 self.residual_exits.setdefault(symbol, {
@@ -667,6 +723,8 @@ class Trader:
 
         # 1. exits decided at this close, executed now at the new bar's open
         for symbol in list(self.positions):
+            if symbol not in bar_symbols:
+                continue
             request = self.residual_exits.get(symbol)
             if request:
                 self._exit(symbol, request['reason'], opens, request['bar_ms'], out)
@@ -712,7 +770,8 @@ class Trader:
         self.last_bar_ms = bar_ms
 
         # 4. trailing stops move once per bar, monotonically
-        self._sync_protective_orders(out, entry_ms, state=state)
+        self._sync_protective_orders(out, entry_ms,
+                                     allowed_symbols=bar_symbols if quarantine_active else None, state=state)
 
         if self.pending_operation is None:
             self.inflight_bar_ms = None
@@ -950,6 +1009,10 @@ class Trader:
         for symbol, p in self.positions.items():
             if self.pending_operation is not None:
                 return
+            if symbol in self._history_quarantined_symbols(state):
+                continue
+            if state is not None and not self._symbol_verified(state, symbol):
+                continue
             if allowed_symbols is not None and symbol not in allowed_symbols:
                 continue
             if self._uncertain_market_order(symbol):

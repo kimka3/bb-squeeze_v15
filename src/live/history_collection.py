@@ -165,8 +165,8 @@ class HistoryCollector:
         # Funding's recent server window cannot establish campaign-wide scope.
         full = crossed_campaign or (not nxt and (kind == 'trades' or
                                                 checkpoint['start_ms'] == self.ledger.start_ms))
-        normalized = self.ledger._normalize_rows(rows if kind == 'trades' else [],
-                                                 rows if kind == 'funding' else [])
+        normalized, quarantined = self.ledger._normalize_rows(rows if kind == 'trades' else [],
+                                                              rows if kind == 'funding' else [])
         updated = copy.deepcopy(state)
         if complete:
             updated[lane] = None
@@ -182,7 +182,9 @@ class HistoryCollector:
                                   updated['audit']['end_ms'] <= checkpoint['end_ms']):
                 updated['audit'] = None
         with self.db:
-            self.ledger._store_rows(normalized, checkpoint['end_ms'])
+            # Unsupported but attributable records and their raw evidence are
+            # durable before advancing a page. They do not certify economics.
+            self.ledger._store_rows(normalized, checkpoint['end_ms'], quarantined)
             if complete:
                 self._clear_cursors(kind, lane)
             elif nxt:
@@ -263,7 +265,10 @@ class HistoryCollector:
                            **state['last_call']}
         complete = all(item['head_complete'] for item in kinds.values())
         coverage = self.db.execute('SELECT end_ms FROM history_coverage WHERE id=1').fetchone()
+        issues = self.ledger.historical_issues()
         return {'head_complete':complete, 'pending_reason':None if complete else 'head_backlog',
+                'historical_evidence_complete':not issues, 'historical_issues':issues,
+                'quarantined_history_count':len(issues),
                 'full_audit_complete_through_ms':coverage[0] if coverage else None,
                 'kinds':kinds,
                 'per_call_requests':sum(item['head_requests']+item['audit_requests'] for item in kinds.values()),

@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import time
 from copy import deepcopy
+from dataclasses import asdict
 
-from .execution_evidence import UnverifiedExecution, number
+from .execution_evidence import Intent, UnverifiedExecution, number
 from .live_check import price_tick
 
 
@@ -92,7 +93,8 @@ def _target(trader, op, p):
 def _complete(trader, op, *, flat=False):
     trader.journal.append('stop_renewal_completed', symbol=op['symbol'],
         old_coi=op['old_ref']['client_order_index'], new_coi=op['coi'],
-        order_expiry_ms=(op.get('new_ref') or {}).get('order_expiry_ms'), flat=flat)
+        order_expiry_ms=(op.get('new_ref') or {}).get('order_expiry_ms'), flat=flat,
+        superseded_cois=list(op.get('superseded_cois', [])))
     trader.pending_operation = None
     trader._save()
 
@@ -102,7 +104,7 @@ def _cleanup_flat(trader, op, state):
     op['phase'] = 'flat_cleanup'
     trader._save()
     store = trader.broker.engine.store
-    for coi in (op['old_ref']['client_order_index'], op['coi']):
+    for coi in (op['old_ref']['client_order_index'], *op.get('superseded_cois', []), op['coi']):
         found = store.load(coi)
         if found is None:
             if coi == op['coi'] and _active(state, trader, op['symbol'], coi) is None:
@@ -121,6 +123,69 @@ def _cleanup_flat(trader, op, state):
     # Cancel acknowledgements are insufficient; engine.cancel waits for terminal
     # evidence. The next normal fill sync removes the old position/TP snapshot.
     _complete(trader, op, flat=True)
+
+
+def _apply_replacement_plan(trader, op):
+    """Finish a write-ahead supersession, including a crash after DB commit."""
+    plan = op.get('replacement_plan')
+    if plan is None:
+        return
+    replacement = Intent(**plan['intent'])
+    proof = plan['proof']
+    if (plan['old_coi'] != op['coi'] or proof.get('kind') != 'stop_renewal'
+            or any(proof.get(key) != op[key] for key in ('symbol', 'side', 'entry_cycle', 'cycle_ms'))
+            or proof.get('old_protection_coi') != op['old_ref']['client_order_index']):
+        raise UnverifiedExecution('stop replacement plan belongs to a different renewal')
+    trader.broker._bind(replacement.client_order_index, op['symbol'], op['side'], 'SL')
+    trader.broker.engine.store.supersede_not_submitted(plan['old_coi'], replacement, proof)
+    trader.journal.append('stop_renewal_superseded', symbol=op['symbol'],
+        old_coi=plan['old_coi'], new_coi=replacement.client_order_index,
+        entry_cycle=op['entry_cycle'], quantity=replacement.quantity,
+        trigger=replacement.trigger_price, evidence='retryable_confirmed_non_submission')
+    op.setdefault('superseded_cois', []).append(plan['old_coi'])
+    op.update(coi=replacement.client_order_index, qty=float(replacement.quantity),
+              trigger=float(replacement.trigger_price), phase='create')
+    for key in ('replacement_plan', 'new_ref', 'amend_qty', 'amend_trigger'):
+        op.pop(key, None)
+    trader._save()
+
+
+def _require_existing_protection(trader, op, state, now_ms):
+    active = _active(state, trader, op['symbol'], op['old_ref']['client_order_index'])
+    if (active is None or active.get('armed') is not True
+            or type(active.get('order_expiry_ms')) is not int
+            or active['order_expiry_ms'] <= now_ms):
+        raise UnverifiedExecution('stop supersession requires existing unexpired protection')
+
+
+def _supersede_changed_unsent(trader, op, state, now_ms, target_qty, target_trigger):
+    """Only a proved unsent stop may receive a distinct ID for changed terms."""
+    store = trader.broker.engine.store
+    found = store.load(op['coi'])
+    if found is None or not store.known_not_submitted(op['coi']):
+        return
+    original = found[0]
+    if (number(original.quantity) == target_qty and
+            number(original.trigger_price) == target_trigger):
+        return  # Unchanged terms retain the existing strictly gated retry path.
+    detail = store.submission_details(op['coi'])
+    if not detail['retryable']:
+        raise UnverifiedExecution('non-retryable stop refusal cannot be superseded')
+    _require_existing_protection(trader, op, state, now_ms)
+    generation = trader.protection_generation.get(op['symbol'], 0) + 1
+    coi = trader._coi(op['cycle_ms'], op['symbol'], 'SL_RENEWAL', seq=generation)
+    if (coi in (op['coi'], op['old_ref']['client_order_index'], *op.get('superseded_cois', []))
+            or store.load(coi) is not None or coi in trader.broker._bindings()):
+        raise UnverifiedExecution('stop supersession replacement identity collision')
+    replacement = trader.broker._intent(trader.markets[op['symbol']], op['side'],
+        target_qty, coi, closing=True, kind='stop-loss', price=target_trigger, trigger=target_trigger)
+    proof = {'kind': 'stop_renewal', 'symbol': op['symbol'], 'side': op['side'],
+             'entry_cycle': op['entry_cycle'], 'cycle_ms': op['cycle_ms'],
+             'old_protection_coi': op['old_ref']['client_order_index'], 'created_ms': now_ms}
+    op['replacement_plan'] = {'old_coi': op['coi'], 'intent': asdict(replacement), 'proof': proof}
+    trader.protection_generation[op['symbol']] = generation
+    trader._save()  # Preserve both IDs before binding/reserving any replacement.
+    _apply_replacement_plan(trader, op)
 
 
 def start_renewal(trader, symbol, now_ms, out, state=None):
@@ -176,6 +241,10 @@ def recover_renewal(trader, op, out, state=None, *, now_ms=None, fresh_symbols=N
     store = trader.broker.engine.store
     state = state if state is not None else trader.broker.account_state()
     p, actual = _position(trader, op, state)
+    # This step is local-only and idempotent. Finish its identity link even if
+    # the position became flat while the process was stopped, then clean every
+    # recorded ID using the ordinary positive-evidence cleanup path.
+    _apply_replacement_plan(trader, op)
     if actual is None:
         _cleanup_flat(trader, op, state)
         return
@@ -187,8 +256,11 @@ def recover_renewal(trader, op, out, state=None, *, now_ms=None, fresh_symbols=N
         out.reasons.append(f'{symbol}: stop renewal awaits a fresh mark')
         return
     target_qty, target_trigger = _target(trader, op, p)
+    _supersede_changed_unsent(trader, op, state, now_ms, target_qty, target_trigger)
     found = store.load(op['coi'])
     if found is None or store.known_not_submitted(op['coi']):
+        if op.get('superseded_cois'):
+            _require_existing_protection(trader, op, state, now_ms)
         # Existing durable terms are immutable on a known-not-submitted retry;
         # first creation takes the now-reconciled quantity, never stale exposure.
         if found is None:

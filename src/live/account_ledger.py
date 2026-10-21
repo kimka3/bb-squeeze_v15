@@ -12,6 +12,41 @@ from urllib.parse import urlencode
 from .execution_evidence import UnverifiedExecution, number
 
 
+class UnsupportedHistoryRecord(UnverifiedExecution):
+    """A well-formed, attributable record whose economic meaning is unknown.
+
+    This exception is deliberately narrower than a schema/identity failure.
+    Keeping its raw evidence does not make it a supported fill or settlement.
+    """
+    def __init__(self, kind, identity, market_id, timestamp_ms, reason, unsupported_value, raw):
+        self.issue = {'kind':kind, 'id':identity, 'market_id':market_id,
+                      'timestamp_ms':timestamp_ms, 'reason':reason,
+                      'unsupported_value':unsupported_value}
+        try:
+            self.raw = json.loads(json.dumps(raw, sort_keys=True, allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise UnverifiedExecution('invalid raw history record') from exc
+        super().__init__(reason)
+
+
+class HistoricalEvidenceBlocked(UnverifiedExecution):
+    """Preserved unsupported account history blocks strict certification."""
+    def __init__(self, issues):
+        self.issues = issues
+        super().__init__('unsupported account history remains quarantined')
+
+
+def _history_object(row):
+    if not isinstance(row, dict) or any(not isinstance(key, str) for key in row):
+        raise UnverifiedExecution('invalid history row')
+
+
+def _history_token(value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise UnverifiedExecution('invalid '+label)
+    return value
+
+
 def signed(value):
     if value is None or isinstance(value,bool):
         raise UnverifiedExecution('missing signed amount')
@@ -67,32 +102,43 @@ raises and never replaces a previous successful reconciliation.
 
 
 def normalize_trade(row, account):
-    ask=row.get('ask_account_id')==account
-    bid=row.get('bid_account_id')==account
+    _history_object(row)
+    ask=integer(row.get('ask_account_id'))==integer(account)
+    bid=integer(row.get('bid_account_id'))==account
     if ask==bid: raise UnverifiedExecution('unrelated or self-trade cannot be attributed')
-    if row.get('type')!='trade' or type(row.get('is_maker_ask')) is not bool:
-        raise UnverifiedExecution('unsupported trade kind/role')
+    kind=_history_token(row.get('type'),'trade kind')
+    if type(row.get('is_maker_ask')) is not bool:
+        raise UnverifiedExecution('invalid trade liquidity role')
     side='ask' if ask else 'bid'
     role='maker' if row['is_maker_ask']==ask else 'taker'
     qty=number(row.get('size')); price=number(row.get('price')); quote=number(row.get('usd_amount'))
     if qty<=0 or price<=0 or abs(qty*price-quote)>Decimal('0.000001'):
         raise UnverifiedExecution('trade size/quote mismatch')
     fees={k:row.get(k) for k in (role+'_fee','integrator_'+role+'_fee')}
-    known=all(v is not None and signed(v)==0 for v in fees.values())
-    return {'trade_id':integer(row.get('trade_id')),'market_id':integer(row.get('market_id')),
+    fee_values=[signed(v) if v is not None else None for v in fees.values()]
+    known=all(v is not None and v==0 for v in fee_values)
+    normalized={'trade_id':integer(row.get('trade_id')),'market_id':integer(row.get('market_id')),
             'coi':integer(row.get(side+'_client_id')),'order_index':integer(row.get(side+'_id')),
             'timestamp_ms':integer(row.get('timestamp')),'is_ask':ask,'liquidity_role':role,
             'qty':str(qty),'quote':str(quote),'price':str(price),'fee_usdc':'0' if known else None,
             'fee_evidence':fees,'realized_pnl':str(signed(row[side+'_account_pnl'])) if side+'_account_pnl' in row else None}
+    if kind!='trade':
+        raise UnsupportedHistoryRecord('trade',str(normalized['trade_id']),normalized['market_id'],
+            normalized['timestamp_ms'],'unsupported_trade_type',kind,row)
+    return normalized
 
 
 def normalize_funding(row):
-    side=row.get('position_side')
-    if side not in ('long','short'): raise UnverifiedExecution('unknown funding side')
-    return {'funding_id':integer(row.get('funding_id')),'market_id':integer(row.get('market_id')),
+    _history_object(row)
+    side=_history_token(row.get('position_side'),'funding side')
+    normalized={'funding_id':integer(row.get('funding_id')),'market_id':integer(row.get('market_id')),
             'timestamp_ms':integer(row.get('timestamp'))*1000,'cash_change':str(signed(row.get('change'))),
             'discount_raw':str(signed(row.get('discount'))),'position_size':str(number(row.get('position_size'))),
             'position_side':side,'rate':str(signed(row.get('rate')))}
+    if side not in ('long','short'):
+        raise UnsupportedHistoryRecord('funding',f"{normalized['market_id']}:{normalized['funding_id']}",
+            normalized['market_id'],normalized['timestamp_ms'],'unsupported_funding_side',side,row)
+    return normalized
 
 
 class AccountLedger:
@@ -106,6 +152,8 @@ class AccountLedger:
         if old and old[0]!=identity: raise UnverifiedExecution('ledger account/campaign mismatch')
         self.db.execute('INSERT OR IGNORE INTO ledger_identity VALUES(1,?)',(identity,))
         self.db.execute('CREATE TABLE IF NOT EXISTS events(kind TEXT,id TEXT,value TEXT,PRIMARY KEY(kind,id))')
+        self.db.execute('CREATE TABLE IF NOT EXISTS history_quarantine '
+                        '(kind TEXT,id TEXT,value TEXT,PRIMARY KEY(kind,id))')
         self.db.execute('CREATE TABLE IF NOT EXISTS history_coverage(id INTEGER PRIMARY KEY,end_ms INTEGER)')
         self.db.commit()
         from .history_collection import HistoryCollector
@@ -117,29 +165,84 @@ class AccountLedger:
         return self.collector.collect(transport,end_ms)
 
     def _normalize_rows(self,trades,funding):
-        normalized=[('trade',str(v['trade_id']),v) for v in [normalize_trade(r,self.account) for r in trades]]
-        return normalized + [('funding',f"{v['market_id']}:{v['funding_id']}",v) for v in map(normalize_funding,funding)]
+        normalized=[]; quarantined=[]
+        for kind,rows in (('trade',trades),('funding',funding)):
+            for row in rows:
+                try:
+                    value=normalize_trade(row,self.account) if kind=='trade' else normalize_funding(row)
+                except UnsupportedHistoryRecord as exc:
+                    quarantined.append((kind,exc.issue['id'],{**exc.issue,'raw':exc.raw}))
+                    continue
+                identity=str(value['trade_id']) if kind=='trade' else f"{value['market_id']}:{value['funding_id']}"
+                normalized.append((kind,identity,value))
+        return normalized,quarantined
 
-    def _store_rows(self,normalized,end_ms):
+    def _store_rows(self,normalized,end_ms,quarantined=()):
         # Caller owns the transaction, including any cursor checkpoint. A
         # correction must never silently overwrite previously recorded evidence.
         for kind,identity,value in normalized:
             if not self.start_ms<=value['timestamp_ms']<=end_ms: raise UnverifiedExecution('history outside scope')
+            if self.db.execute('SELECT 1 FROM history_quarantine WHERE kind=? AND id=?',(kind,identity)).fetchone():
+                raise UnverifiedExecution('history event conflicts with quarantined evidence')
             encoded=json.dumps(value,sort_keys=True)
             prior=self.db.execute('SELECT value FROM events WHERE kind=? AND id=?',(kind,identity)).fetchone()
             if prior and prior[0]!=encoded: raise UnverifiedExecution('history event changed')
             self.db.execute('INSERT OR IGNORE INTO events VALUES(?,?,?)',(kind,identity,encoded))
+        for kind,identity,value in quarantined:
+            if not self.start_ms<=value['timestamp_ms']<=end_ms: raise UnverifiedExecution('history outside scope')
+            if self.db.execute('SELECT 1 FROM events WHERE kind=? AND id=?',(kind,identity)).fetchone():
+                raise UnverifiedExecution('quarantined history conflicts with supported evidence')
+            encoded=json.dumps(value,sort_keys=True,allow_nan=False)
+            prior=self.db.execute('SELECT value FROM history_quarantine WHERE kind=? AND id=?',(kind,identity)).fetchone()
+            if prior and prior[0]!=encoded: raise UnverifiedExecution('quarantined history event changed')
+            self.db.execute('INSERT OR IGNORE INTO history_quarantine VALUES(?,?,?)',(kind,identity,encoded))
 
     def ingest(self,trades,funding,end_ms):
         old=self.db.execute('SELECT end_ms FROM history_coverage WHERE id=1').fetchone()
         if old and end_ms<old[0]: raise UnverifiedExecution('coverage regression')
-        normalized=self._normalize_rows(trades,funding)
+        normalized,quarantined=self._normalize_rows(trades,funding)
         with self.db:
-            self._store_rows(normalized,end_ms)
+            self._store_rows(normalized,end_ms,quarantined)
             self.db.execute('INSERT OR REPLACE INTO history_coverage VALUES(1,?)',(end_ms,))
 
     def events(self,kind):
         return [json.loads(r[0]) for r in self.db.execute('SELECT value FROM events WHERE kind=?',(kind,))]
+
+    def quarantined_events(self):
+        """Return immutable raw evidence after validating its stored identity."""
+        out=[]
+        for kind,identity,encoded in self.db.execute('SELECT kind,id,value FROM history_quarantine ORDER BY kind,id'):
+            try:
+                saved=json.loads(encoded)
+                if kind not in ('trade','funding') or not isinstance(saved,dict):
+                    raise UnverifiedExecution('invalid quarantined history record')
+                raw=saved['raw']
+                try:
+                    normalize_trade(raw,self.account) if kind=='trade' else normalize_funding(raw)
+                except UnsupportedHistoryRecord as exc:
+                    expected={**exc.issue,'raw':exc.raw}
+                    if (json.dumps(saved,sort_keys=True,allow_nan=False)!=json.dumps(expected,sort_keys=True,allow_nan=False)
+                            or saved['kind']!=kind or saved['id']!=identity):
+                        raise UnverifiedExecution('quarantined history identity mismatch')
+                    if self.db.execute('SELECT 1 FROM events WHERE kind=? AND id=?',(kind,identity)).fetchone():
+                        raise UnverifiedExecution('quarantined history conflicts with supported evidence')
+                    if saved['timestamp_ms']<self.start_ms:
+                        raise UnverifiedExecution('quarantined history outside campaign')
+                    out.append(saved)
+                else:
+                    raise UnverifiedExecution('quarantined history unexpectedly supported')
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UnverifiedExecution('invalid quarantined history record') from exc
+        return out
+
+    def historical_issues(self):
+        return [{key:value for key,value in row.items() if key!='raw'} for row in self.quarantined_events()]
+
+    def strict_report(self):
+        report=self.report()
+        if report['historical_issues']:
+            raise HistoricalEvidenceBlocked(report['historical_issues'])
+        return report
 
     def order_totals(self,coi,order_index=None):
         rows=[r for r in self.events('trade') if r['coi']==coi]
@@ -152,6 +255,7 @@ class AccountLedger:
 
     def report(self):
         trades=self.events('trade'); funding=self.events('funding')
+        historical_issues=self.historical_issues()
         missing=sum(r['fee_usdc'] is None for r in trades)
         by_role={}
         for r in trades:
@@ -162,9 +266,13 @@ class AccountLedger:
                 'funding_count':len(funding),'funding_cash_change':str(sum((signed(r['cash_change']) for r in funding),Decimal(0))),
                 'funding_discount_interpretation_verified':not any(signed(r['discount_raw']) for r in funding),
                 'liquidity_roles':by_role,'performance_complete':False,
+                'historical_evidence_complete':not historical_issues,'historical_issues':historical_issues,
+                'historical_evidence_scope':'supported interpretation of observed records; collection coverage is separate',
+                'quarantined_history_count':len(historical_issues),
                 'history_collection':self.collector.report(),
                 'limitations':['fee fields missing or nonzero are not converted without verified units',
                                'funding cash changes are account records, not modeled market rates',
+                               'quarantined unsupported records are excluded from monetary totals and block strict certification',
                                'equity transfers and realized PnL must reconcile before performance certification']}
 
     def attribute_funding(self,bindings):
@@ -177,6 +285,7 @@ at the same timestamp as settlement makes ordering ambiguous and stays unknown.
         # trade table for every settlement made a growing live ledger quadratic.
         # Keep exact timestamp ambiguity and unowned-fill rules unchanged.
         fundings=self.events('funding'); trades_by_market={}; funding_by_market={}
+        untrusted_markets={issue['market_id'] for issue in self.historical_issues()}
         for trade in self.events('trade'):
             trades_by_market.setdefault(trade['market_id'],[]).append(trade)
         for index,funding in enumerate(fundings):
@@ -196,7 +305,7 @@ at the same timestamp as settlement makes ordering ambiguous and stays unknown.
                     quantity=held.get(cycle,Decimal(0))+number(trade['qty'])*(-1 if trade['is_ask'] else 1)
                     if quantity: held[cycle]=quantity
                     else: held.pop(cycle,None)
-                ambiguous=unowned_seen or latest_trade_ms==funding['timestamp_ms']
+                ambiguous=market in untrusted_markets or unowned_seen or latest_trade_ms==funding['timestamp_ms']
                 candidates=[c for c,q in held.items() if ('long' if q>0 else 'short')==funding['position_side']]
                 out[index]={**funding,'cycle':candidates[0] if len(candidates)==1 and not ambiguous else None}
         return out

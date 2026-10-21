@@ -71,6 +71,8 @@ class ExecutionEngine:
 
     def create(self, intent: Intent, size_decimals, price_decimals, *, stop_quantity=None,
                resting=False, retry_not_submitted=False):
+        if intent.client_order_index in self.store.supersessions():
+            raise UnverifiedExecution('superseded non-submitted order must never be resent')
         base = scaled(intent.quantity, size_decimals)
         price = scaled(intent.price, price_decimals)
         trigger = scaled(intent.trigger_price, price_decimals)
