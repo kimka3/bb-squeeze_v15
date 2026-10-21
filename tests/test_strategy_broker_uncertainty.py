@@ -515,7 +515,7 @@ def test_partial_stop_is_visible_but_not_armed_and_allows_verified_residual_clos
     assert x.rows[11]['status']=='canceled'
 
 
-def test_partial_stop_without_matching_fill_history_cannot_authorize_residual_close(broker):
+def test_partial_stop_with_owned_order_account_proof_can_reduce_despite_detail_lag(broker):
     x,b,m=broker
     enter(b,m)
     b.place_stop(m['ETHUSDT'],'ETHUSDT','LONG',1,94,11)
@@ -524,9 +524,10 @@ def test_partial_stop_without_matching_fill_history_cannot_authorize_residual_cl
     state=b.account_state()
     assert 'ETH' not in state.ledger_report['verified_symbols']
     assert state.ledger_report['unsafe_protection']['11']['reason']=='stop_partially_filled'
-    with pytest.raises(NotSubmitted) as caught:
-        b.market_order(m['ETHUSDT'],'ETHUSDT','LONG',.6,True,12,100)
-    assert isinstance(caught.value.cause,UnverifiedExecution) and len(x.sent)==2
+    assert 'ETH' in state.ledger_report['risk_verified_symbols']
+    assert not state.ledger_report['publication_pending']  # unsafe stop still requires safety handling
+    fill=b.market_order(m['ETHUSDT'],'ETHUSDT','LONG',.6,True,12,100)
+    assert fill.qty==.6 and x.position[0]==0 and x.sent[-1].reduce_only
 
 
 def test_valid_parent_dependent_stop_is_unsafe_not_a_global_read_exception(broker):

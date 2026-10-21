@@ -79,6 +79,8 @@ class Trader:
         self.orphan_orders = dict(snap.get('orphan_orders', {}))
         self.data_gaps = list(snap.get('data_gaps', []))
         self.protection_generation = dict(snap.get('protection_generation', {}))
+        self.publication_pending = bool(snap.get('publication_pending', False))
+        self.publication_pending_evidence = list(snap.get('publication_pending_evidence', []))
         self._needs_recovery = bool(self.pending_operation or self.unresolved_operations or self.inflight_bar_ms)
         # Unsubmitted candidates are deliberately not restored after a restart.
         self.deferred_entries = None
@@ -106,6 +108,7 @@ class Trader:
         guard = getattr(self.broker, 'entry_guard', None)
         if (now >= batch['deadline_ms'] or now < batch['bar_ms']+H4
                 or self.halted or self.pending_operation or self.unresolved_operations or self.data_gaps
+                or self.publication_pending
                 or (guard is not None and not guard())):
             self.journal.append('entry_deferred_discarded', bar_ms=batch['bar_ms'],
                                 symbols=list(batch['requests']),
@@ -140,6 +143,7 @@ class Trader:
                     out.skipped.append((symbol, 'deferred candidate no longer eligible'))
                     continue
                 state = self.broker.account_state()
+                self.observe_publication(state.ledger_report)
                 margin = guards.check_margin(state, self.config)
                 mismatch = guards.reconcile(self.positions, state, self.config_symbol_map)
                 if (margin.block_entries or mismatch.halt or not state.execution_changes_verified
@@ -177,6 +181,8 @@ class Trader:
             'orders': self.orders, 'last_bar_ms': self.last_bar_ms,
             'pending_operation': self.pending_operation,
             'unresolved_operations': self.unresolved_operations,
+            'publication_pending': self.publication_pending,
+            'publication_pending_evidence': self.publication_pending_evidence,
             'inflight_bar_ms': self.inflight_bar_ms,
             'halted': self.halted, 'halt_reasons': self.halt_reasons,
             'residual_exits': self.residual_exits, 'orphan_orders': self.orphan_orders,
@@ -210,7 +216,44 @@ class Trader:
 
     def _symbol_verified(self, state, symbol):
         return (state.execution_changes_verified or
-                self.config_symbol_map[symbol] in state.ledger_report.get('verified_symbols', []))
+                self.config_symbol_map[symbol] in state.ledger_report.get('verified_symbols', []) or
+                self.config_symbol_map[symbol] in state.ledger_report.get('risk_verified_symbols', []))
+
+    def observe_publication(self, report):
+        """Record strictly classified detail-history lag without clearing HALT.
+
+        The broker proves owned cumulative fills against the actual account.
+        This permits risk management only; full history is still required for
+        entries and for all three stable exchange-recovery success cycles.
+        """
+        evidence = report.get('publication_pending_evidence') if isinstance(report, dict) else None
+        risk_symbols = report.get('risk_verified_symbols') if isinstance(report, dict) else None
+        pending = (isinstance(report, dict) and report.get('publication_pending') is True
+                   and isinstance(evidence, list) and bool(evidence)
+                   and all(isinstance(item, dict) for item in evidence)
+                   and isinstance(risk_symbols, list) and all(isinstance(s, str) for s in risk_symbols)
+                   and not report.get('unresolved_orders') and not report.get('unsafe_protection'))
+        recovery = getattr(self, 'exchange_recovery', None)
+        if pending and recovery is None:
+            # Without the durable controller there is no three-cycle stability
+            # gate after convergence. Keep the existing explicit safety halt.
+            pending = False
+            self._halt('owned execution publication pending without automatic recovery; inspect before resume')
+        changed = pending != self.publication_pending
+        self.publication_pending = pending
+        self.publication_pending_evidence = list(evidence) if pending else []
+        if pending:
+            if self.deferred_entries is not None:
+                batch = self.deferred_entries
+                self.deferred_entries = None
+                self.journal.append('entry_deferred_discarded', bar_ms=batch['bar_ms'],
+                    symbols=list(batch['requests']), reason='owned execution publication pending')
+            recovery.publication_wait(self.publication_pending_evidence)
+        if changed:
+            self.journal.append('execution_publication_state', pending=pending,
+                                evidence=self.publication_pending_evidence)
+            self._save()
+        return pending
 
     def _uncertain_market_order(self, symbol):
         ops = list(self.unresolved_operations.values()) + ([self.pending_operation] if self.pending_operation else [])
@@ -235,6 +278,10 @@ class Trader:
             # when durable local evidence proves dispatch never started.
             self._park_operation()
         self._save()
+        if exc.reason == 'account_publication_pending':
+            if not self.observe_publication(getattr(self.broker, 'last_report', {})):
+                self._halt('publication wait lacks verified classification; inspect account evidence')
+            return
         cause = exc.cause
         if cause is not None and hasattr(cause, 'automatic_recovery_allowed'):
             # Preserve the existing classification and recovery thresholds.
@@ -256,7 +303,8 @@ class Trader:
     def _sync_fills(self, state) -> list[str]:
         """Apply ledger-confirmed changes; a smaller position is not TP proof."""
         notes = []
-        if state.ledger_report and not state.execution_changes_verified:
+        pending = self.observe_publication(state.ledger_report)
+        if state.ledger_report and not state.execution_changes_verified and not pending:
             self._halt('account execution history does not reconcile; new entries halted')
         reverse = {v: k for k, v in self.config_symbol_map.items()}
         live = {}
@@ -272,7 +320,7 @@ class Trader:
                 if not verified:
                     self._halt(f'{symbol}: unexplained disappearance; execution evidence required')
                     continue
-                notes.append(f'{symbol}: closure confirmed by execution ledger')
+                notes.append(f'{symbol}: closure confirmed by owned execution evidence')
                 self._cancel_protective(symbol, self.markets[symbol])
                 self.positions.pop(symbol)
                 self.orders.pop(symbol, None)
@@ -286,7 +334,7 @@ class Trader:
                     self._halt(f'{symbol}: unexplained reduction; execution evidence required')
                     continue
                 p['qty'] = float(actual['qty'])
-                notes.append(f'{symbol}: ledger-confirmed residual quantity {p["qty"]}')
+                notes.append(f'{symbol}: residual quantity confirmed by owned execution evidence: {p["qty"]}')
             if (verified and actual.get('partial_taken') is True
                     and not p['partial_taken']):
                 apply_tp_fill(p)
@@ -404,6 +452,7 @@ class Trader:
                 self._sync_protective_orders(out, now_ms, fresh_symbols=fresh_symbols,
                                              allowed_symbols=safe_symbols, state=state)
         out.halted = (self.halted or self.pending_operation is not None
+                      or self.publication_pending
                       or bool(self.unresolved_operations) or bool(self.residual_exits) or bool(self.orphan_orders))
         out.reasons += self.halt_reasons
         self._save()
@@ -624,7 +673,7 @@ class Trader:
 
         # 2. entries in canonical order, one at a time
         entry_block = (out.halted or margin.block_entries or not allow_entries
-                       or bool(self.residual_exits))
+                       or bool(self.residual_exits) or self.publication_pending)
         for symbol in self.universe:
             req = self.pending.pop(symbol, None)
             if req is None or symbol in self.positions:
@@ -641,6 +690,10 @@ class Trader:
             # which is exactly what the backtest does when it recomputes
             # wealth=eq(opens) inside its allocation loop.
             entry_state = self.broker.account_state()
+            if self.observe_publication(entry_state.ledger_report):
+                entry_block = True
+                out.skipped.append((symbol, 'owned execution publication pending'))
+                continue
             bounded = hasattr(self.broker, 'entry_deadline_ms')
             if bounded:
                 self.broker.entry_deadline_ms = entry_ms + self.config.bar_grace_seconds*1000
@@ -663,7 +716,8 @@ class Trader:
 
         if self.pending_operation is None:
             self.inflight_bar_ms = None
-        out.halted = self.halted or self.pending_operation is not None or bool(self.residual_exits)
+        out.halted = (self.halted or self.pending_operation is not None
+                      or bool(self.residual_exits) or self.publication_pending)
         self._save()
         self.journal.append('bar', bar_ms=bar_ms, equity=state.equity,
                             exits=out.exits, entries=out.entries, skipped=out.skipped,

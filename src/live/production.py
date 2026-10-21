@@ -152,12 +152,16 @@ def health(live,*,active=True,now_ms=None,for_resume=False):
             pause_reason=(reason if reason in ('operator pause','operational monitor','operator stop requested')
                           else 'unrecognized pause marker')
         except (OSError,UnicodeError,ValueError):pause_reason='unreadable pause marker'
-    elif (live.state_dir/'EXCHANGE_PAUSED').exists():pause_reason='exchange recovery checks pending'
+    elif (live.state_dir/'EXCHANGE_PAUSED').exists():
+        pause_reason=('owned execution publication pending' if state.get('publication_pending') is True
+                      else 'exchange recovery checks pending')
     if for_resume and (live.state_dir/'EXCHANGE_PAUSED').exists():
         issues.append('automatic exchange recovery checks still pending')
     return {'checked_at_ms':now_ms,'healthy':not issues,'issues':issues,
             'entries_paused':paused,'entry_pause_reason':pause_reason,
             'automatic_recovery':recovery,
+            'publication_pending':state.get('publication_pending', False),
+            'publication_pending_evidence':state.get('publication_pending_evidence', []),
             'last_successful_service_ms':state.get('last_successful_service_ms'),
             'last_successful_poll_ms':state.get('last_successful_poll_ms'),
             'alert_delivery':'local attention.json and system journal; no external notifications'}

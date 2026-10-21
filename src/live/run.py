@@ -401,6 +401,8 @@ def handle_entry_retry_failure(trader, exc, coverage, counters, *, now_ms=None):
 
 def persist_report(trader, config, coverage=None, **health) -> None:
     now_ms = int(time.time() * 1000)
+    if isinstance(trader.broker, StrategyBroker):
+        trader.observe_publication(trader.broker.last_report)
     entry_guard=getattr(trader.broker,'entry_guard',None)
     if entry_guard is not None:
         paused=not entry_guard()
@@ -439,6 +441,8 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         'halt_reasons': list(getattr(trader, 'halt_reasons', [])),
         'pending_operation': getattr(trader, 'pending_operation', None),
         'unresolved_operations': getattr(trader, 'unresolved_operations', {}),
+        'publication_pending': getattr(trader, 'publication_pending', False),
+        'publication_pending_evidence': getattr(trader, 'publication_pending_evidence', []),
         'residual_exits': getattr(trader, 'residual_exits', {}),
         'orphan_orders': getattr(trader, 'orphan_orders', {}),
         'api_read_diagnostics_error': getattr(getattr(trader.broker, 'transport', None),

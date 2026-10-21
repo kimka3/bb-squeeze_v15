@@ -108,26 +108,34 @@ class AccountLedger:
         self.db.execute('CREATE TABLE IF NOT EXISTS events(kind TEXT,id TEXT,value TEXT,PRIMARY KEY(kind,id))')
         self.db.execute('CREATE TABLE IF NOT EXISTS history_coverage(id INTEGER PRIMARY KEY,end_ms INTEGER)')
         self.db.commit()
+        from .history_collection import HistoryCollector
+        self.collector=HistoryCollector(self)
 
     def close(self): self.db.close()
 
     def collect(self,transport,end_ms):
-        trades=history(transport,'trades',self.start_ms,end_ms)
-        funding=history(transport,'funding',self.start_ms,end_ms)
-        self.ingest(trades,funding,end_ms)
+        return self.collector.collect(transport,end_ms)
+
+    def _normalize_rows(self,trades,funding):
+        normalized=[('trade',str(v['trade_id']),v) for v in [normalize_trade(r,self.account) for r in trades]]
+        return normalized + [('funding',f"{v['market_id']}:{v['funding_id']}",v) for v in map(normalize_funding,funding)]
+
+    def _store_rows(self,normalized,end_ms):
+        # Caller owns the transaction, including any cursor checkpoint. A
+        # correction must never silently overwrite previously recorded evidence.
+        for kind,identity,value in normalized:
+            if not self.start_ms<=value['timestamp_ms']<=end_ms: raise UnverifiedExecution('history outside scope')
+            encoded=json.dumps(value,sort_keys=True)
+            prior=self.db.execute('SELECT value FROM events WHERE kind=? AND id=?',(kind,identity)).fetchone()
+            if prior and prior[0]!=encoded: raise UnverifiedExecution('history event changed')
+            self.db.execute('INSERT OR IGNORE INTO events VALUES(?,?,?)',(kind,identity,encoded))
 
     def ingest(self,trades,funding,end_ms):
         old=self.db.execute('SELECT end_ms FROM history_coverage WHERE id=1').fetchone()
         if old and end_ms<old[0]: raise UnverifiedExecution('coverage regression')
-        normalized=[('trade',str(v['trade_id']),v) for v in [normalize_trade(r,self.account) for r in trades]]
-        normalized += [('funding',f"{v['market_id']}:{v['funding_id']}",v) for v in map(normalize_funding,funding)]
+        normalized=self._normalize_rows(trades,funding)
         with self.db:
-            for kind,identity,value in normalized:
-                if not self.start_ms<=value['timestamp_ms']<=end_ms: raise UnverifiedExecution('history outside scope')
-                encoded=json.dumps(value,sort_keys=True)
-                prior=self.db.execute('SELECT value FROM events WHERE kind=? AND id=?',(kind,identity)).fetchone()
-                if prior and prior[0]!=encoded: raise UnverifiedExecution('history event changed')
-                self.db.execute('INSERT OR IGNORE INTO events VALUES(?,?,?)',(kind,identity,encoded))
+            self._store_rows(normalized,end_ms)
             self.db.execute('INSERT OR REPLACE INTO history_coverage VALUES(1,?)',(end_ms,))
 
     def events(self,kind):
@@ -154,6 +162,7 @@ class AccountLedger:
                 'funding_count':len(funding),'funding_cash_change':str(sum((signed(r['cash_change']) for r in funding),Decimal(0))),
                 'funding_discount_interpretation_verified':not any(signed(r['discount_raw']) for r in funding),
                 'liquidity_roles':by_role,'performance_complete':False,
+                'history_collection':self.collector.report(),
                 'limitations':['fee fields missing or nonzero are not converted without verified units',
                                'funding cash changes are account records, not modeled market rates',
                                'equity transfers and realized PnL must reconcile before performance certification']}

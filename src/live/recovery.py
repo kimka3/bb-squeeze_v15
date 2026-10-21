@@ -136,6 +136,28 @@ class ExchangeRecovery:
             # restart cannot reinterpret this as an ordinary temporary outage.
             self._persist()
 
+    def publication_wait(self, evidence):
+        """A proved owned-fill publication gap blocks entries, not risk service.
+
+        This is not an exception whitelist and does not forgive an unknown
+        write. The broker must classify the complete read before calling it.
+        Clearing this gate still requires the unchanged normal cycle checks.
+        """
+        if (not isinstance(evidence, list) or not evidence
+                or not all(isinstance(item, dict) for item in evidence)):
+            raise ValueError('publication wait requires classified evidence')
+        newly_waiting = self.reason != 'execution_publication_pending' or self.ready
+        self._reset()
+        self.reason = 'execution_publication_pending'
+        self.blockers = ['execution_publication_pending']
+        self._persist()
+        if newly_waiting:
+            try:
+                self.journal.append('execution_publication_wait', session=self.session, evidence=evidence)
+            except OSError as exc:
+                self.storage_error = type(exc).__name__
+                self._persist()
+
     def can_enter(self):
         return self._can_enter_at(self.monotonic())
 
@@ -171,6 +193,8 @@ class ExchangeRecovery:
         if getattr(trader.broker.transport, 'read_diagnostics_error', None): problems.append('diagnostics')
         if trader.broker.last_report.get('execution_changes_verified') is not True:
             problems.append('execution_not_reconciled')
+        if getattr(trader, 'publication_pending', False):
+            problems.append('execution_publication_pending')
         current = coverage.snapshot()
         gaps=current.get('active_gap_streams') if isinstance(current,dict) else None
         if not isinstance(gaps,list) or gaps: problems.append('active_data_gap')
@@ -185,6 +209,7 @@ class ExchangeRecovery:
         if problems:
             self._reset(); self.blockers = problems
             self.reason = ('manual_inspection_required' if 'diagnostics' in problems
+                           else 'execution_publication_pending' if 'execution_publication_pending' in problems
                            else 'recovery_checks_pending')
             self._persist()
             return

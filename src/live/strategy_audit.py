@@ -19,7 +19,8 @@ def audit(transport,sessions,output,*,clock=time.time):
     output=Path(output); output.mkdir(parents=True,exist_ok=True)
     ledger=AccountLedger(output/'audit-ledger.sqlite',transport.network,transport.account_index,sessions[0]['started_at_ms'])
     try:
-        ledger.collect(transport,int(clock()*1000))
+        collected_through_ms=int(clock()*1000)
+        ledger.collect(transport,collected_through_ms)
         evidence=[]; owned=set()
         for session in sessions:
             orders=[(session['first_coi'],'ENTRY',session['entry_result'])]
@@ -43,9 +44,12 @@ def audit(transport,sessions,output,*,clock=time.time):
         change=signed(account['total_asset_value'])-signed(sessions[0]['equity_before'])
         cash=sum((number(r['quote'])*(1 if r['is_ask'] else -1) for r in trades),Decimal(0))
         funding_cash=sum((signed(r['cash_change']) for r in funding),Decimal(0))
-        result={**ledger.report(),'account_index':transport.account_index,'checked_at_ms':int(clock()*1000),
+        ledger_report=ledger.report()
+        result={**ledger_report,'account_index':transport.account_index,'checked_at_ms':int(clock()*1000),
             'order_comparisons':evidence,'unowned_trade_ids':unowned,
-            'all_order_fills_match':all(e['matches'] for e in evidence) and not unowned,
+            'all_order_fills_match':(all(e['matches'] for e in evidence) and not unowned
+                and ledger_report.get('history_collection',{}).get('head_complete',False)
+                and (ledger_report.get('history_collection',{}).get('full_audit_complete_through_ms') or 0)>=collected_through_ms),
             'open_position_count':len(positions(account)),'active_order_count':len(active),
             'equity_before':sessions[0]['equity_before'],'equity_after':account['total_asset_value'],
             'equity_change':str(change),'trade_cash_change':str(cash),

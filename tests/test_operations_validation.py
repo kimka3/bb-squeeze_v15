@@ -126,17 +126,30 @@ def test_insufficient_request_headroom_skips_entry_before_durable_order_intent(t
 
 
 def test_delayed_history_blocks_entries_but_keeps_native_stop(tmp_path):
+    from live.recovery import ExchangeRecovery
+    from test_exchange_recovery import Coverage
     x,b,t=setup(tmp_path)
     try:
         t.on_bar(START,rows(),{'BTCUSDT':100,'ETHUSDT':100},now_ms=x.now)
+        recovery=ExchangeRecovery(tmp_path,'reviewed',clock=lambda:x.now/1000,monotonic=lambda:x.now/1000)
+        t.exchange_recovery=recovery
+        b.entry_guard=recovery.can_enter
         trades=x.trades; x.trades=[]; sent=len(x.sent)
         t.service(now_ms=x.now,marks={'ETHUSDT':100})
-        assert t.halted and len(x.sent)==sent
+        assert not t.halted and t.publication_pending and len(x.sent)==sent
+        assert t.publication_pending_evidence and not recovery.can_enter()
+        assert (tmp_path/'EXCHANGE_PAUSED').exists() and not (tmp_path/'ENTRY_PAUSED').exists()
         assert any(r['type']=='stop-loss' for r in x.active_orders())
         x.trades=trades
-        assert b.account_state().execution_changes_verified
-        # Recovery of reads does not silently erase the persistent safety halt.
-        assert t.halted
+        for index in range(3):
+            x.now+=60000
+            b.poll()
+            t.service(now_ms=x.now,marks={'ETHUSDT':100})
+            recovery.cycle(t,Coverage(),poll_ok=True,service_ok=True,now_ms=x.now)
+            assert not t.halted and not t.publication_pending
+            assert b.last_report['execution_changes_verified']
+            assert recovery.can_enter() is (index==2)
+        assert len(x.sent)==sent
     finally:b.close()
 
 

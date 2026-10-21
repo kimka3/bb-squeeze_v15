@@ -1,8 +1,10 @@
 """Trader adapter for the verified execution engine. Writes disabled by default.
 
-Construction is dependency-injected; the production CLI remains gated. Account
-position changes must equal owned order fills and paginated trade history before
-the Trader is allowed to attribute a partial exit to its TP order.
+Construction is dependency-injected; the production CLI remains gated. Entries
+require complete current history reconciliation. Risk management may use exact
+owned cumulative order/account exposure while detail publication is pending;
+TP attribution still requires the owned TP order's complete fill, never a
+position-size heuristic. This does not certify the detailed cost ledger.
 """
 from decimal import Decimal, ROUND_FLOOR
 import json
@@ -108,7 +110,9 @@ class StrategyBroker:
         # Always refresh before a new reducing mutation/retry. A clean market
         # remains manageable when another market has an unknown owned order.
         state=self.account_state()
-        if market.symbol not in state.ledger_report.get('verified_symbols',[]):
+        managed=set(state.ledger_report.get('verified_symbols',[]))
+        managed.update(state.ledger_report.get('risk_verified_symbols',[]))
+        if market.symbol not in managed:
             raise UnverifiedExecution('market owned exposure is not reconciled')
         actual=state.positions.get(market.symbol)
         if actual is None and flat_allowed: return state
@@ -210,6 +214,8 @@ class StrategyBroker:
                     state=(offered[1] if offered is not None and 0<=self.clock()-offered[0]<=1
                            else self.account_state())
                     if not state.execution_changes_verified:
+                        if state.ledger_report.get('publication_pending'):
+                            raise NotSubmitted('account_publication_pending',retryable=True)
                         raise UnverifiedExecution('entry requires reconciled owned exposure')
                     if state.positions.get(market.symbol) is not None:
                         raise UnverifiedExecution('new entry into an existing position refused')
@@ -336,11 +342,15 @@ class StrategyBroker:
         # reconciliation. Unknown submissions and identity/schema failures do
         # not qualify; exceptions, including budget cooldown, propagate.
         self._entry_state=None
+        already_waiting=self.last_report.get('publication_pending',False)
         for attempt in (1,2):
             state,read_mismatch=self._account_state_once()
             state.ledger_report['reconciliation_read_attempts']=attempt
             self.last_report=state.ledger_report
-            if not read_mismatch or attempt==2: return state
+            # Once strictly classified, a sustained publication wait gets one
+            # fresh cycle, not a repeated double scan on every service call.
+            if not read_mismatch or attempt==2 or (already_waiting and state.ledger_report.get('publication_pending')):
+                return state
 
     def _account_state_once(self):
         self._entry_state=None
@@ -355,6 +365,7 @@ class StrategyBroker:
         bindings=self._bindings(); results={}; intents={}; expected={}; tp_done={}; costs={}
         unresolved={}; not_submitted={}; unverified_markets=set(); read_mismatches=set()
         unknown_ownership=False
+        publication_evidence=[]; hard_markets=set(); cycle_exposure={}
         def diagnostic(coi,reason,**extra):
             b=bindings[coi]
             return {'symbol':b['symbol'],'role':b['role'],'cycle':b['cycle'],'reason':reason,**extra}
@@ -399,6 +410,7 @@ class StrategyBroker:
             results[coi]=result
             key=intent.market_index
             expected[key]=expected.get(key,Decimal(0))+number(result['filled_qty'])*(-1 if intent.is_ask else 1)
+            cycle_exposure[b['cycle']]=cycle_exposure.get(b['cycle'],Decimal(0))+number(result['filled_qty'])*(-1 if intent.is_ask else 1)
         for coi in unresolved_amendments:
             if coi not in bindings or coi not in intents:
                 raise UnverifiedExecution('amendment lacks owned intent')
@@ -423,6 +435,7 @@ class StrategyBroker:
             if trade['coi'] not in intents:
                 unverified_markets.add(trade['market_id'])
                 unknown_ownership=True
+                hard_markets.add(trade['market_id'])
         confirmed_entries=set()
         for coi,intent in intents.items():
             b=bindings[coi]; result=results.get(coi); rows=grouped.get(coi,[])
@@ -441,9 +454,21 @@ class StrategyBroker:
             if result is not None and not matches:
                 unverified_markets.add(intent.market_index)
                 read_mismatches.add(intent.market_index)
+                # A lag is a strict, nonnegative subset of a validated owned
+                # order. Equal quantity with a different quote, excess history
+                # or inconsistent identity is never a publication wait.
+                if (totals['qty']<number(result['filled_qty']) and
+                        totals['quote']<number(result['filled_quote'])):
+                    publication_evidence.append({'client_order_index':coi,'order_index':result['order_index'],
+                        'symbol':b['symbol'],'market_id':intent.market_index,'role':b['role'],'cycle':b['cycle'],
+                        'order_filled_qty':result['filled_qty'],'order_filled_quote':result['filled_quote'],
+                        'history_filled_qty':str(totals['qty']),'history_filled_quote':str(totals['quote'])})
+                else:
+                    hard_markets.add(intent.market_index)
             if result is None and rows:
                 unverified_markets.add(intent.market_index)
                 unknown_ownership=True
+                hard_markets.add(intent.market_index)
             if b['role']=='ENTRY' and matches and result['terminal'] and totals['qty']>0:
                 confirmed_entries.add(coi)
             if b['role']=='TP' and matches and result['status']=='filled' and totals['qty']==number(intent.quantity):
@@ -456,9 +481,28 @@ class StrategyBroker:
             if expected.get(key,Decimal(0))!=actual.get(key,Decimal(0)):
                 unverified_markets.add(key)
                 read_mismatches.add(key)
+                hard_markets.add(key)
+        # Do not certify a net match assembled from offsetting old and new
+        # cycles. Every nonzero owned cycle must be the current cycle, in its
+        # entry direction and no larger than its verified entry fill.
+        for cycle,net in cycle_exposure.items():
+            b=bindings[cycle]; entry=results.get(cycle); market=self.markets[b['symbol']].market_id
+            if net and (entry is None or not entry['terminal'] or
+                    cycle!=self._cycle(b['symbol']) or
+                    net*(1 if b['side']=='LONG' else -1)<=0 or abs(net)>number(entry['filled_qty'])):
+                hard_markets.add(market); unverified_markets.add(market)
         for coi,item in unresolved.items():
+            hard_markets.add(intents[int(coi)].market_index)
             if item['role'] in ('SL','TP') and item['cycle'] not in confirmed_entries:
                 unverified_markets.add(intents[int(coi)].market_index)
+        risk_verified_symbols=sorted(m.symbol for _,m in self.by_id.values() if m.market_id not in hard_markets)
+        # An owned full TP order plus exact owned/account exposure is evidence
+        # for risk management even before its trade-detail rows are published.
+        for coi,result in results.items():
+            b=bindings[coi]; intent=intents[coi]
+            if (intent.market_index not in hard_markets and b['role']=='TP' and
+                    result['status']=='filled' and number(result['filled_qty'])==number(intent.quantity)):
+                tp_done[b['cycle']]=True
         active_map={}; unsafe_protection={}
         for row in active:
             coi=row.get('client_order_index'); b=bindings.get(coi)
@@ -516,11 +560,24 @@ class StrategyBroker:
         verified_symbols=sorted(m.symbol for _,m in self.by_id.values() if m.market_id not in unverified_markets)
         pending_protection=any(item['role'] in ('SL','TP') and actual.get(intents[int(coi)].market_index)
                                for coi,item in not_submitted.items())
-        verified=not unresolved and not unverified_markets and not pending_protection and not unsafe_protection
+        head_complete=report.get('history_collection',{}).get('head_complete',True)
+        if not head_complete:
+            publication_evidence.append({'type':'history_head_backlog',
+                'pending_reason':report.get('history_collection',{}).get('pending_reason')})
+        publication_pending=(bool(publication_evidence or not head_complete) and not hard_markets
+                             and not unknown_ownership and not unresolved and not pending_protection
+                             and not unsafe_protection)
+        verified=(not unresolved and not unverified_markets and not pending_protection
+                  and not unsafe_protection and head_complete)
         report.update(order_roles=costs,execution_changes_verified=verified,
                       unresolved_orders=unresolved,not_submitted_orders=not_submitted,
                       unsafe_protection=unsafe_protection,
                       verified_symbols=verified_symbols,
+                      risk_verified_symbols=risk_verified_symbols,
+                      publication_pending=publication_pending,
+                      publication_pending_reason=('owned_trade_details_pending' if read_mismatches else 'history_head_backlog') if publication_pending else None,
+                      publication_pending_evidence=publication_evidence,
+                      owned_exposure_matches_account=not hard_markets and not unknown_ownership and not unresolved,
                       funding_attributions=self.ledger.attribute_funding(bindings),
                       funding_scope='settled account cash changes attributed to owned holding intervals')
         equity=number(account['total_asset_value'])
@@ -530,6 +587,13 @@ class StrategyBroker:
             # cannot inflate sizing beyond the actual current account equity.
             cash=sum((number(r['quote'])*(1 if r['is_ask'] else -1)
                       for r in trades if r['coi'] in bindings),Decimal(0))
+            if publication_pending:
+                # Missing EXIT detail must not manufacture a zero allocation
+                # and a margin panic. Order cumulative cash is independently
+                # verified; entry sizing remains disabled until ledger catchup.
+                cash=sum((number(result['filled_quote'])*(1 if intents[coi].is_ask else -1)
+                          for coi,result in results.items()),Decimal(0))
+                report['pending_risk_cash_source']='verified_owned_order_cumulative_quotes; new_entries_blocked'
             holding=sum((abs(signed(r['position_value']))*(1 if r['sign']==1 else -1)
                          for r in account['positions'] if number(r['position'])>0),Decimal(0))
             funding=sum((signed(r['cash_change']) for r in report['funding_attributions']
