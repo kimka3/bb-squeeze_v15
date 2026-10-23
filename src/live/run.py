@@ -401,6 +401,8 @@ def handle_entry_retry_failure(trader, exc, coverage, counters, *, now_ms=None):
 
 def persist_report(trader, config, coverage=None, **health) -> None:
     now_ms = int(time.time() * 1000)
+    safety_resolution = (trader.safety_resolution.status()
+                         if getattr(trader, 'safety_resolution', None) else None)
     if isinstance(trader.broker, StrategyBroker):
         trader.observe_publication(trader.broker.last_report)
     entry_guard=getattr(trader.broker,'entry_guard',None)
@@ -432,6 +434,7 @@ def persist_report(trader, config, coverage=None, **health) -> None:
         atomic_json(config.state_dir/'report.json',{
             **trader.broker.last_report,'updated_ms':now_ms,'classification':'authenticated_account_ledger',
             'strategy_data_gaps':trader.data_gaps,'runtime_coverage':runtime_coverage,
+            'safety_resolution':safety_resolution,
             'unresolved_operations':getattr(trader, 'unresolved_operations', {}),
             'trader_halted':trader.halted,'halt_reasons':trader.halt_reasons,'performance_complete':False})
     atomic_json(config.state_dir / 'runner_status.json', {
@@ -449,6 +452,7 @@ def persist_report(trader, config, coverage=None, **health) -> None:
                                               'read_diagnostics_error', None),
         'automatic_recovery': (trader.exchange_recovery.snapshot()
                                if getattr(trader,'exchange_recovery',None) else None),
+        'safety_resolution': safety_resolution,
         'data_gaps': list(getattr(trader, 'data_gaps', [])),
         'deferred_entries': ({k:v for k,v in trader.deferred_entries.items() if k!='rows'}
                              if getattr(trader, 'deferred_entries', None) else None),
@@ -538,6 +542,16 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                 # Earlier fills can be persisted before a later poll request
                 # fails. Reconcile them without stale-price close retries.
                 service_failed = False
+                resolution = getattr(trader, 'safety_resolution', None)
+                resolution_error = None
+                if resolution is not None:
+                    try:
+                        resolution.before_service()
+                    except Exception as exc:
+                        # A broken optional operator case must not suppress
+                        # ordinary protection of independently verified risk.
+                        # Latch it after service so success cannot hide it.
+                        resolution_error = exc
                 try:
                     trader.service(marks={} if poll_failed else None)
                     counters['last_successful_service_ms'] = int(time.time() * 1000)
@@ -550,6 +564,22 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                     counters['last_error'] = f'service: {exc}'
                     trader.journal.append('service_error', error=str(exc))
                     coverage.failure('service', int(time.time() * 1000), str(exc))
+                if resolution is not None and resolution_error is None and not poll_failed and not service_failed:
+                    try:
+                        # The existing account owner processes reviewed requests
+                        # only after ordinary protection and a fresh good poll.
+                        # Its on-demand fresh reconciliation never submits orders.
+                        resolution.after_service(coverage)
+                    except Exception as exc:
+                        resolution_error = exc
+                if resolution_error is not None:
+                    service_failed = True
+                    if getattr(trader, 'exchange_recovery', None):
+                        trader.exchange_recovery.failure(resolution_error, 'safety_resolution')
+                    counters['service_errors'] += 1
+                    counters['last_error'] = f'safety_resolution: {resolution_error}'
+                    trader.journal.append('safety_resolution_error', error=str(resolution_error))
+                    coverage.failure('service', int(time.time() * 1000), str(resolution_error))
                 next_poll_at = time.time() + config.poll_seconds
                 if getattr(trader,'exchange_recovery',None):
                     trader.exchange_recovery.cycle(trader,coverage,poll_ok=not poll_failed,

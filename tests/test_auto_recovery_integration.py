@@ -170,6 +170,11 @@ class StopSignal:
 
 def bootstrap_fixture(monkeypatch, campaign, *, waits=(False,)):
     cfg, live, approval, _, _ = campaign
+    # This fixture isolates bootstrap/recovery orchestration. Resolution has
+    # separate identity and queue integration coverage; no cases are queued.
+    monkeypatch.setattr(production, 'SafetyResolution', lambda *args: SimpleNamespace(
+        before_service=lambda: None, after_service=lambda coverage: None,
+        status=lambda: {'pending': 0}))
     # Real controller must create its own session and own its files, not inherit
     # the monitor fixture's synthetic marker.
     (live.state_dir / 'EXCHANGE_PAUSED').unlink()

@@ -79,6 +79,10 @@ class Trader:
         self.orphan_orders = dict(snap.get('orphan_orders', {}))
         self.data_gaps = list(snap.get('data_gaps', []))
         self.protection_generation = dict(snap.get('protection_generation', {}))
+        applied_resolutions = snap.get('safety_resolutions_applied', {})
+        if not isinstance(applied_resolutions, dict):
+            raise ValueError('safety resolution receipts must be an object')
+        self.safety_resolutions_applied = dict(applied_resolutions)
         self.publication_pending = bool(snap.get('publication_pending', False))
         self.publication_pending_evidence = list(snap.get('publication_pending_evidence', []))
         self._needs_recovery = bool(self.pending_operation or self.unresolved_operations or self.inflight_bar_ms)
@@ -186,10 +190,51 @@ class Trader:
             'inflight_bar_ms': self.inflight_bar_ms,
             'halted': self.halted, 'halt_reasons': self.halt_reasons,
             'residual_exits': self.residual_exits, 'orphan_orders': self.orphan_orders,
-            'data_gaps': self.data_gaps, 'protection_generation': self.protection_generation})
+            'data_gaps': self.data_gaps, 'protection_generation': self.protection_generation,
+            'safety_resolutions_applied': self.safety_resolutions_applied})
 
     def _halt(self, reason: str) -> None:
         self.halted = True
+        # Classify only failures emitted by the matching durable operation.
+        # Exception text is retained as evidence, never parsed as permission to
+        # release a halt. Ambiguous legacy/general failures remain unchanged.
+        op = self.pending_operation
+        if (type(reason) is str and type(op) is dict
+                and type(op.get('symbol')) is str and op['symbol'] in self.universe
+                and type(op.get('kind')) is str
+                and type(op.get('bar_ms')) is int and op['bar_ms'] >= 0):
+            symbol, kind = op['symbol'], op['kind']
+            valid_coi = type(op.get('coi')) is int and op['coi'] > 0
+            valid_side = op.get('side') in ('LONG', 'SHORT')
+            valid_qty = (type(op.get('qty')) in (int, float)
+                         and math.isfinite(op['qty']) and op['qty'] > 0)
+            valid_trigger = (type(op.get('trigger')) in (int, float)
+                             and math.isfinite(op['trigger']) and op['trigger'] > 0)
+            classifications = {
+                'entry': ('entry/protection outcome unresolved', valid_coi and valid_side
+                          and op.get('phase') in ('submit', 'protect')),
+                'exit': ('exit outcome unresolved', valid_coi and valid_side and valid_qty),
+                'protection': ('protective placement unresolved', True),
+                'amend': ('stop amendment outcome unresolved', valid_coi and valid_qty and valid_trigger),
+                'stop_renewal': ('stop renewal requires reconciliation', valid_coi and valid_side
+                    and valid_qty and valid_trigger and type(op.get('old_ref')) is dict
+                    and type(op['old_ref'].get('client_order_index')) is int
+                    and op['old_ref']['client_order_index'] > 0
+                    and op['old_ref']['client_order_index'] != op['coi']
+                    and type(op.get('cycle_ms')) is int and op['cycle_ms'] >= 0
+                    and type(op.get('entry_cycle')) is int and op['entry_cycle'] > 0
+                    and op.get('phase') in ('create', 'verify_new', 'amend_new', 'cancel_old', 'flat_cleanup')),
+            }
+            classification = classifications.get(kind)
+            if classification and classification[1]:
+                prefix = f'{symbol}: {classification[0]}: '
+                recovery_prefix = 'operation recovery failed: '
+                if ((reason.startswith(prefix) and len(reason) > len(prefix))
+                        or (reason.startswith(recovery_prefix) and len(reason) > len(recovery_prefix))):
+                    canonical = f'{symbol}: {classification[0]}; execution evidence required'
+                    self.journal.append('execution_halt_detail', reason=reason,
+                                        canonical_reason=canonical, operation=op)
+                    reason = canonical
         if reason not in self.halt_reasons:
             self.halt_reasons.append(reason)
             self.journal.append('safety_halt', reason=reason)

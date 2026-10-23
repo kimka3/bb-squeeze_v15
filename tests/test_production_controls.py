@@ -305,6 +305,7 @@ def test_service_recovers_existing_campaign_before_running_loop(tmp_path,monkeyp
         assert kw['account_lock_path']==cfg['account_lock_path']
         return Trader(),{}
     monkeypatch.setattr(production.runner,'build_authenticated_strategy',factory)
+    monkeypatch.setattr(production,'SafetyResolution',lambda *a:object())
     monkeypatch.setattr(production.runner,'run_loop',lambda *a:calls.append('loop'))
     monkeypatch.setattr(production.signal,'signal',lambda *a:None)
     production.run_service(cfg,live,fingerprint)

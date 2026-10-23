@@ -116,6 +116,22 @@ class ExchangeRecovery:
             self.storage_error = type(exc).__name__
             self._reset()
 
+    def require_revalidation(self):
+        """A reviewed HALT release still requires a new ordinary recovery run.
+
+        Do not grant permission, reuse earlier success counts or remove the
+        independent manual pause. Persist the gate before the caller changes
+        the safety snapshot; a storage failure must prevent that change.
+        """
+        self._reset()
+        if self.storage_error:
+            raise RuntimeError('recovery evidence unavailable; safety release blocked')
+        self.reason = 'safety_resolution_verification'
+        self.blockers = []
+        self._persist()
+        if self.storage_error:
+            raise RuntimeError('recovery evidence unavailable; safety release blocked')
+
     def failure(self, exc, stream):
         self._reset()
         temporary = is_transient_read_error(exc) or isinstance(exc, RequestDeferred)

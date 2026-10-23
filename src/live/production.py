@@ -23,6 +23,7 @@ from . import run as runner
 from .recovery import ExchangeRecovery, operator_pause, safety_pause, OWNER
 from .authenticated import is_transient_read_error
 from .request_budget import RequestDeferred
+from .safety_resolution import SafetyResolution
 
 UNIT='bb-squeeze-live.service'
 TIMER='bb-squeeze-live-health.timer'
@@ -230,6 +231,9 @@ def run_service(cfg,live,fingerprint):
                                               and (recovery.can_enter() if recovery else
                                                    not (live.state_dir/'EXCHANGE_PAUSED').exists()))
             trader.exchange_recovery=recovery
+            trader.safety_resolution=SafetyResolution(trader, fingerprint, live.account_index,
+                next(network for network, host in HOSTS.items() if host == live.base_url),
+                approval['started_at_ms'])
             # No on_bar/entry until first account reconciliation and recovery.
             if recovery is None:
                 trader.broker.poll(); trader.service()
