@@ -65,6 +65,16 @@ published ready state, fresh reconciliation, no blocking markers and entries
 allowed. The observer neither implements nor bypasses the trading recovery
 conditions.
 
+The health oneshot temporarily has a zero exit timestamp while running. A
+normal `activating/start` transition is re-read only within two seconds of its
+original start, with at most ten 200 ms waits and the existing five-second
+service-query budget. Healthy still requires the same invocation to complete
+successfully; a recent start is never accepted as successful health evidence.
+Failure, timer shutdown, changed invocation or trading PID, invalid timestamps,
+and an unfinished run at the deadline remain unhealthy. The 180-second stale
+completion threshold is unchanged. A successful run taking longer than this
+short observation window can conservatively produce an alert.
+
 The external check also detects absence of pings if the VPS, sidecar or network
 fails. With Period 1 minute and Grace 2 minutes, nominal missing-ping detection is
 three minutes after the last accepted ping, plus provider and Telegram delivery

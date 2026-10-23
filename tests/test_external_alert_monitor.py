@@ -281,6 +281,121 @@ def test_health_timer_does_not_hide_failed_or_stalled_oneshot(state, monkeypatch
         assert 'HEALTH_SERVICE_STALE' in assessment['reason_codes']
 
 
+@pytest.fixture
+def transitioning_health(monkeypatch):
+    """Model the observed systemd zero-exit window without services or sleeps."""
+    clock = {'us': 1_000_000_000_000, 'start': 999_999_900_000, 'calls': [], 'sleeps': []}
+    monkeypatch.setattr(monitor.time, 'monotonic_ns', lambda: clock['us'] * 1000)
+    def sleep(seconds):
+        clock['sleeps'].append(seconds)
+        clock['us'] += round(seconds * 1_000_000)
+    monkeypatch.setattr(monitor.time, 'sleep', sleep)
+    def install(responder):
+        def run(args, **kwargs):
+            clock['calls'].append(kwargs['timeout'])
+            fields = {'ActiveState':'activating', 'SubState':'start', 'Result':'success',
+                      'ExecMainStatus':0, 'ExecMainStartTimestampMonotonic':clock['start'],
+                      'ExecMainExitTimestampMonotonic':0}
+            updates = responder(clock)
+            if isinstance(updates, Exception): raise updates
+            fields.update(updates)
+            trade_active = fields.pop('trade_active', 'active')
+            pid = fields.pop('trade_pid', 42)
+            timer_active = fields.pop('timer_active', 'active')
+            raw = (f'Id={monitor.SERVICE}\nActiveState={trade_active}\nSubState=running\nMainPID={pid}\n\n'
+                   f'Id={monitor.HEALTH_TIMER}\nActiveState={timer_active}\n\n'
+                   f'Id={monitor.HEALTH_SERVICE}\n' + ''.join(f'{k}={v}\n' for k,v in fields.items())).encode()
+            return subprocess.CompletedProcess(args, 0, raw)
+        monkeypatch.setattr(monitor.subprocess, 'run', run)
+        return clock
+    return install
+
+
+def completed_health(clock):
+    return {'ActiveState':'inactive', 'SubState':'dead',
+            'ExecMainExitTimestampMonotonic':clock['us'] - 1000}
+
+
+def test_observed_oneshot_race_waits_for_same_success_and_sends_only_up(state, transitioning_health):
+    clock = transitioning_health(lambda c: completed_health(c) if c['us']-c['start'] >= 1_106_264 else {})
+    sent = []
+    result = monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services,
+                             sender=lambda cfg, healthy, codes: sent.append((healthy,codes)) or True)
+    assert result['healthy'] and sent == [(True, [])]
+    assert len(clock['calls']) > 1 and sum(clock['sleeps']) <= 2
+    assert all(0 < t <= 5 for t in clock['calls'])
+
+
+def test_still_running_never_becomes_healthy_and_does_not_extend_start_deadline(state, transitioning_health):
+    clock = transitioning_health(lambda c: {})
+    service = monitor.probe_services(state[0])
+    assert not service['health_service_fresh']
+    assert clock['us'] - clock['start'] <= 2_000_000
+    assert len(clock['calls']) <= monitor.HEALTH_RECHECKS + 1
+    assert 'HEALTH_SERVICE_STALE' in assess(state, service_probe=lambda _:service)['reason_codes']
+
+
+@pytest.mark.parametrize('update', [
+    {'ExecMainStartTimestampMonotonic':999_997_999_999},
+    {'ExecMainStartTimestampMonotonic':1_000_000_000_001},
+    {'ExecMainStartTimestampMonotonic':0},
+    {'ExecMainStartTimestampMonotonic':'invalid'},
+    {'ActiveState':'inactive', 'SubState':'dead'},
+    {'SubState':'start-pre'}, {'Result':'exit-code','ExecMainStatus':1},
+    {'trade_active':'inactive'}, {'timer_active':'inactive'},
+])
+def test_no_retry_for_old_invalid_failed_or_unhealthy_start(state, transitioning_health, update):
+    clock = transitioning_health(lambda c:update)
+    result = assess(state, service_probe=monitor.probe_services)
+    assert not result['healthy'] and len(clock['calls']) == 1 and not clock['sleeps']
+
+
+@pytest.mark.parametrize('update,code', [
+    ({'ActiveState':'failed','Result':'exit-code','ExecMainStatus':1},'HEALTH_SERVICE_FAILED'),
+    ({'ActiveState':'failed','Result':'timeout','ExecMainStatus':0},'HEALTH_SERVICE_FAILED'),
+    ({'ActiveState':'inactive','Result':'signal','ExecMainStatus':9},'HEALTH_SERVICE_FAILED'),
+    ({'timer_active':'inactive'},'HEALTH_TIMER_INACTIVE'),
+    ({'trade_active':'inactive'},'SERVICE_INACTIVE'),
+    ({'trade_pid':43},'SERVICE_IDENTITY_MISMATCH'),
+    ({'ExecMainStartTimestampMonotonic':1_000_000_100_000},'HEALTH_SERVICE_STALE'),
+    ({'ExecMainExitTimestampMonotonic':999_999_899_999},'HEALTH_SERVICE_STALE'),
+])
+def test_transition_does_not_hide_failure_or_changed_invocation(state, transitioning_health, update, code):
+    clock = transitioning_health(lambda c: {} if len(c['calls'])==1 else {**completed_health(c),**update})
+    result = assess(state, service_probe=monitor.probe_services)
+    assert not result['healthy'] and code in result['reason_codes']
+    assert len(clock['calls']) == 2
+
+
+def test_timeout_during_recheck_is_not_normal_completion(state, transitioning_health):
+    clock = transitioning_health(lambda c:{} if len(c['calls'])==1 else subprocess.TimeoutExpired('systemctl', .5))
+    assert assess(state, service_probe=monitor.probe_services)['reason_codes'] == ['SERVICE_UNAVAILABLE']
+    assert len(clock['calls']) == 2 and clock['calls'][1] < 2
+
+
+def test_first_slow_read_cannot_reset_overall_five_second_budget(state, transitioning_health):
+    def respond(c):
+        c['us'] += 4_900_000
+        return {'ExecMainStartTimestampMonotonic':c['us']-100_000}
+    clock = transitioning_health(respond)
+    assert not monitor.probe_services(state[0])['health_service_fresh']
+    assert len(clock['calls']) == 1 and not clock['sleeps']
+
+
+@pytest.mark.parametrize('marker', ['HALT', 'ENTRY_PAUSED'])
+def test_stop_created_during_health_recheck_still_sends_down(state, transitioning_health, marker):
+    def respond(c):
+        if len(c['calls']) == 1: return {}
+        write(state[0].state_dir / marker, {})
+        return completed_health(c)
+    transitioning_health(respond)
+    sent=[]
+    result=monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services,
+                            sender=lambda cfg, healthy, codes:sent.append((healthy,codes)) or True)
+    assert not result['healthy'] and len(sent)==1 and sent[0][0] is False
+    assert ('STRATEGY_HALTED' if marker=='HALT' else 'ENTRIES_PAUSED') in result['reason_codes']
+
+
 @pytest.mark.parametrize('response_status,response_body,expected', [(200, b'OK', True),
     (200, b'OK (not found)', False), (200, b'OK (rate limited)', False),
     (200, b'OK\n', False), (302, b'OK', False), (500, b'PRIVATE ERROR', False),

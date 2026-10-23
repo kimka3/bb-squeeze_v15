@@ -29,6 +29,10 @@ BAR_GRACE_MS = 60_000
 SNAPSHOT_SAVE_ALLOWANCE_MS = 60_000
 MAX_JSON_BYTES = 8 * 1024 * 1024
 SEND_TIMEOUT_SECONDS = 10
+SERVICE_PROBE_SECONDS = 5
+HEALTH_RECHECKS = 10
+HEALTH_RECHECK_SECONDS = 0.2
+HEALTH_START_WINDOW_US = 2_000_000
 SERVICE = 'bb-squeeze-live.service'
 HEALTH_TIMER = 'bb-squeeze-live-health.timer'
 HEALTH_SERVICE = 'bb-squeeze-live-health.service'
@@ -165,35 +169,68 @@ def load_uuid(config):
         raise MonitorError('CONFIG_INVALID') from None
 
 
-def probe_services(config):
-    """Read fixed systemd properties. Bounded wall time, no shell or controls."""
-    try:
-        result = subprocess.run(
-            ['systemctl', 'show', config.service_unit, config.health_timer_unit, HEALTH_SERVICE,
-             '--property=Id,ActiveState,SubState,MainPID,Result,ExecMainStatus,ExecMainExitTimestampMonotonic', '--no-pager'],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
-            check=False, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
-        if result.returncode or len(result.stdout) > 8192:
+def _service_sample(config, timeout):
+    result = subprocess.run(
+        ['systemctl', 'show', config.service_unit, config.health_timer_unit, HEALTH_SERVICE,
+         '--property=Id,ActiveState,SubState,MainPID,Result,ExecMainStatus,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic', '--no-pager'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout,
+        check=False, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+    if result.returncode or len(result.stdout) > 8192:
+        raise ValueError()
+    blocks = {}
+    for block in result.stdout.decode('ascii').strip().split('\n\n'):
+        fields = dict(line.split('=', 1) for line in block.splitlines())
+        name = fields.get('Id')
+        if name in blocks or name not in (config.service_unit, config.health_timer_unit, HEALTH_SERVICE):
             raise ValueError()
-        blocks = {}
-        for block in result.stdout.decode('ascii').strip().split('\n\n'):
-            fields = dict(line.split('=', 1) for line in block.splitlines())
-            name = fields.get('Id')
-            if name in blocks or name not in (config.service_unit, config.health_timer_unit, HEALTH_SERVICE):
-                raise ValueError()
-            blocks[name] = fields
-        service, timer, health = blocks[config.service_unit], blocks[config.health_timer_unit], blocks[HEALTH_SERVICE]
-        # Linux systemd and Python use CLOCK_MONOTONIC here. Unlike wall time,
-        # this cannot mistake an old pre-adjustment clock value for fresh work.
-        exit_us = int(health['ExecMainExitTimestampMonotonic'])
-        exit_age_us = time.monotonic_ns() // 1000 - exit_us
-        health_ok = (health.get('Result') == 'success' and int(health['ExecMainStatus']) == 0
-                     and health.get('ActiveState') in ('inactive', 'active', 'activating'))
-        return {'active': service.get('ActiveState') == 'active' and service.get('SubState') == 'running',
-                'pid': int(service['MainPID']),
-                'timer_active': timer.get('ActiveState') == 'active',
-                'health_service_ok': health_ok,
-                'health_service_fresh': exit_us > 0 and 0 <= exit_age_us <= STALE_MS * 1000}
+        blocks[name] = fields
+    return blocks[config.service_unit], blocks[config.health_timer_unit], blocks[HEALTH_SERVICE]
+
+
+def probe_services(config):
+    """Re-read a short normal oneshot transition; require observed completion.
+
+    systemd resets the exit timestamp while the oneshot runs. Never treat that
+    zero or a recent start as health evidence. All reads and waits share the
+    original five-second budget, and a different invocation cannot renew it.
+    """
+    try:
+        deadline = time.monotonic_ns() + SERVICE_PROBE_SECONDS * 1_000_000_000
+        original_start = None
+        original_pid = None
+        for attempt in range(HEALTH_RECHECKS + 1):
+            remaining = (deadline - time.monotonic_ns()) / 1_000_000_000
+            if remaining <= 0:
+                raise MonitorError('SERVICE_UNAVAILABLE')
+            service, timer, health = _service_sample(config, remaining)
+            now_us = time.monotonic_ns() // 1000
+            if now_us * 1000 > deadline:
+                raise MonitorError('SERVICE_UNAVAILABLE')
+            exit_us = int(health['ExecMainExitTimestampMonotonic'])
+            start_us = int(health.get('ExecMainStartTimestampMonotonic', '0'))
+            health_ok = (health.get('Result') == 'success' and int(health['ExecMainStatus']) == 0
+                         and health.get('ActiveState') in ('inactive', 'active', 'activating'))
+            result = {'active': service.get('ActiveState') == 'active' and service.get('SubState') == 'running',
+                      'pid': int(service['MainPID']), 'timer_active': timer.get('ActiveState') == 'active',
+                      'health_service_ok': health_ok,
+                      'health_service_fresh': exit_us > 0 and 0 <= now_us - exit_us <= STALE_MS * 1000}
+            if original_start is not None:
+                if (start_us != original_start or start_us > now_us or result['pid'] != original_pid
+                        or (exit_us != 0 and (exit_us < start_us or health.get('ActiveState') not in ('inactive', 'active')))):
+                    result['health_service_fresh'] = False
+                    return result
+            transition = (result['active'] and result['timer_active'] and health_ok
+                          and health.get('ActiveState') == 'activating' and health.get('SubState') == 'start'
+                          and exit_us == 0 and 0 < start_us <= now_us
+                          and now_us - start_us <= HEALTH_START_WINDOW_US)
+            if not transition or attempt == HEALTH_RECHECKS:
+                return result
+            original_start = start_us
+            original_pid = result['pid']
+            deadline = min(deadline, (original_start + HEALTH_START_WINDOW_US) * 1000)
+            if (deadline - time.monotonic_ns()) / 1_000_000_000 <= HEALTH_RECHECK_SECONDS:
+                return result  # Still no successful completion; remain unhealthy.
+            time.sleep(HEALTH_RECHECK_SECONDS)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, UnicodeError):
         raise MonitorError('SERVICE_UNAVAILABLE') from None
 
