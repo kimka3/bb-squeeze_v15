@@ -1,0 +1,23 @@
+#!/bin/sh
+# Only the independent notification service is controlled here.
+set -eu
+case "${1:-status}" in
+  status|inspect|check-config|once|test-notification)
+    exec /usr/bin/python3 -B @ALERT_STAGE@/monitor.py --config /etc/bb-squeeze-alerts/config.json "--${1:-status}"
+    ;;
+  configure)
+    exec /usr/bin/python3 -B @ALERT_STAGE@/configure.py
+    ;;
+  start)
+    /usr/bin/python3 -B @ALERT_STAGE@/monitor.py --config /etc/bb-squeeze-alerts/config.json --check-config
+    exec /usr/bin/systemctl enable --now bb-squeeze-alerts.timer
+    ;;
+  stop)
+    /usr/bin/systemctl stop bb-squeeze-alerts.timer
+    exec /usr/bin/systemctl stop bb-squeeze-alerts.service
+    ;;
+  *)
+    echo 'Usage: bb-alerts status|inspect|check-config|configure|start|stop|once|test-notification' >&2
+    exit 2
+    ;;
+esac

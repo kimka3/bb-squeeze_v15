@@ -1,0 +1,36 @@
+[Unit]
+Description=BB Squeeze independent external health notification
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=@ALERT_STAGE@
+ExecStart=/usr/bin/python3 -B @ALERT_STAGE@/monitor.py --config /etc/bb-squeeze-alerts/config.json --once
+TimeoutStartSec=25s
+TimeoutStopSec=5s
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadOnlyPaths=/var/lib/bb-squeeze-live/strategy-01
+ReadWritePaths=/var/lib/bb-squeeze-alerts
+InaccessiblePaths=-/etc/bb-squeeze -/etc/ssh -/var/lib/bb-squeeze-live/strategy-01/execution
+UMask=0077
+MemoryMax=96M
+TasksMax=16
+StandardOutput=journal
+StandardError=journal
+

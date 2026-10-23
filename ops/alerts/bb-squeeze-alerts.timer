@@ -1,0 +1,12 @@
+[Unit]
+Description=Check BB Squeeze external notification every thirty seconds
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=bb-squeeze-alerts.service
+
+[Install]
+WantedBy=timers.target
+
