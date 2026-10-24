@@ -66,14 +66,26 @@ allowed. The observer neither implements nor bypasses the trading recovery
 conditions.
 
 The health oneshot temporarily has a zero exit timestamp while running. A
-normal `activating/start` transition is re-read only within two seconds of its
-original start, with at most ten 200 ms waits and the existing five-second
-service-query budget. Healthy still requires the same invocation to complete
-successfully; a recent start is never accepted as successful health evidence.
-Failure, timer shutdown, changed invocation or trading PID, invalid timestamps,
-and an unfinished run at the deadline remain unhealthy. The 180-second stale
-completion threshold is unchanged. A successful run taking longer than this
-short observation window can conservatively produce an alert.
+normal `activating/start` transition is re-read with at most twenty 200 ms waits
+inside the existing five-second total service-query budget. A successful check
+taking more than two seconds can therefore complete normally. If still running,
+the result is `healthy: false`, `HEALTH_CHECK_RUNNING`, `delivery: deferred`:
+the observer has finished its work but has not established current health.
+It sends neither Up nor Down, does not consume a ping slot, and does not clear
+an existing external Down state. The next scheduled observation checks again.
+
+Pending is allowed only when all other trading checks pass. Failure, query
+errors, timer shutdown, changed invocation or trading PID, invalid timestamps,
+and protection/account/marker problems still send Down. The original 180-second
+freshness threshold bounds unfinished health checks. `health_tracking` preserves
+the first unverified interval in wall and monotonic time, the last observed
+completion, and the last accepted ping. The deadline cannot be renewed by
+repeated observer invocations, health restarts or intervening errors. Clock
+reversal is conservative; a new successful completion must be observed to
+reset the interval. A damaged checkpoint is preserved and sending stops rather
+than silently resetting its deadline. The external missing-ping alarm remains
+independent and active throughout pending. `current_observation: true` only
+dates an observation; it does not turn deferred health into a confirmed Up.
 
 The external check also detects absence of pings if the VPS, sidecar or network
 fails. With Period 1 minute and Grace 2 minutes, nominal missing-ping detection is

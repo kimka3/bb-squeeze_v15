@@ -30,9 +30,10 @@ SNAPSHOT_SAVE_ALLOWANCE_MS = 60_000
 MAX_JSON_BYTES = 8 * 1024 * 1024
 SEND_TIMEOUT_SECONDS = 10
 SERVICE_PROBE_SECONDS = 5
-HEALTH_RECHECKS = 10
+HEALTH_RECHECKS = 20
 HEALTH_RECHECK_SECONDS = 0.2
-HEALTH_START_WINDOW_US = 2_000_000
+HEALTH_TRACKING_KEYS = frozenset({'pending_since_ms', 'pending_since_mono_ns',
+                                 'last_completion_ms', 'last_ping_accepted_at_ms'})
 SERVICE = 'bb-squeeze-live.service'
 HEALTH_TIMER = 'bb-squeeze-live-health.timer'
 HEALTH_SERVICE = 'bb-squeeze-live-health.service'
@@ -42,7 +43,7 @@ REASONS = frozenset({
     'CONFIG_INVALID', 'STATE_MISSING', 'STATE_MALFORMED', 'STATE_TOO_LARGE',
     'STATE_UNREADABLE', 'STATE_STALE', 'STATE_FUTURE', 'STATE_INCONSISTENT',
     'SERVICE_UNAVAILABLE', 'SERVICE_INACTIVE', 'SERVICE_IDENTITY_MISMATCH',
-    'HEALTH_TIMER_INACTIVE', 'HEALTH_SERVICE_FAILED', 'HEALTH_SERVICE_STALE',
+    'HEALTH_TIMER_INACTIVE', 'HEALTH_SERVICE_FAILED', 'HEALTH_SERVICE_STALE', 'HEALTH_CHECK_RUNNING',
     'ACTIVATION_INVALID', 'OWNERSHIP_MISMATCH',
     'STRATEGY_HALTED', 'ENTRIES_PAUSED', 'EXCHANGE_PAUSED', 'RECOVERY_NOT_READY',
     'RECOVERY_STALE', 'STORAGE_ERROR', 'PENDING_OPERATION', 'UNRESOLVED_ORDERS',
@@ -188,11 +189,12 @@ def _service_sample(config, timeout):
 
 
 def probe_services(config):
-    """Re-read a short normal oneshot transition; require observed completion.
+    """Re-read briefly, then distinguish an unfinished check from failure.
 
     systemd resets the exit timestamp while the oneshot runs. Never treat that
     zero or a recent start as health evidence. All reads and waits share the
     original five-second budget, and a different invocation cannot renew it.
+    Exhausting this convenience wait is not the 180-second health deadline.
     """
     try:
         deadline = time.monotonic_ns() + SERVICE_PROBE_SECONDS * 1_000_000_000
@@ -214,6 +216,11 @@ def probe_services(config):
                       'pid': int(service['MainPID']), 'timer_active': timer.get('ActiveState') == 'active',
                       'health_service_ok': health_ok,
                       'health_service_fresh': exit_us > 0 and 0 <= now_us - exit_us <= STALE_MS * 1000}
+            if (start_us > now_us or start_us > exit_us
+                    or health.get('ActiveState') == 'activating'):
+                result['health_service_fresh'] = False
+            if result['health_service_fresh']:
+                result['health_completion_age_ms'] = (now_us - exit_us) // 1000
             if original_start is not None:
                 if (start_us != original_start or start_us > now_us or result['pid'] != original_pid
                         or (exit_us != 0 and (exit_us < start_us or health.get('ActiveState') not in ('inactive', 'active')))):
@@ -222,14 +229,15 @@ def probe_services(config):
             transition = (result['active'] and result['timer_active'] and health_ok
                           and health.get('ActiveState') == 'activating' and health.get('SubState') == 'start'
                           and exit_us == 0 and 0 < start_us <= now_us
-                          and now_us - start_us <= HEALTH_START_WINDOW_US)
+                          and now_us - start_us < STALE_MS * 1000)
+            if transition:
+                result['health_pending_age_ms'] = (now_us - start_us) // 1000
             if not transition or attempt == HEALTH_RECHECKS:
                 return result
             original_start = start_us
             original_pid = result['pid']
-            deadline = min(deadline, (original_start + HEALTH_START_WINDOW_US) * 1000)
-            if (deadline - time.monotonic_ns()) / 1_000_000_000 <= HEALTH_RECHECK_SECONDS:
-                return result  # Still no successful completion; remain unhealthy.
+            if (deadline - time.monotonic_ns()) / 1_000_000_000 <= HEALTH_RECHECK_SECONDS * 2:
+                return result  # In progress; never manufacture completion or failure.
             time.sleep(HEALTH_RECHECK_SECONDS)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, UnicodeError):
         raise MonitorError('SERVICE_UNAVAILABLE') from None
@@ -256,7 +264,9 @@ def _markers(directory):
 def evaluate(config, *, now_ms=None, service_probe=probe_services):
     """Return only a non-sensitive health decision and reason codes."""
     codes = set()
+    tracking = dict.fromkeys(HEALTH_TRACKING_KEYS)
     try:
+        tracking = _previous_health(config)
         before = _markers(config.state_dir)
         activation = read_json(config.state_dir / 'activation.json', 65536)
         snapshot = read_json(config.state_dir / 'snapshot.json')
@@ -299,8 +309,9 @@ def evaluate(config, *, now_ms=None, service_probe=probe_services):
             codes.add('HEALTH_TIMER_INACTIVE')
         if service.get('health_service_ok') is not True:
             codes.add('HEALTH_SERVICE_FAILED')
-        if service.get('health_service_fresh') is not True:
-            codes.add('HEALTH_SERVICE_STALE')
+        health_code = _track_health(tracking, service, now)
+        if health_code:
+            codes.add(health_code)
         if type(runner.get('pid')) is not int or runner['pid'] <= 0 or runner['pid'] != service.get('pid'):
             codes.add('SERVICE_IDENTITY_MISMATCH')
         if runner.get('mode') != 'live' or report.get('classification') != 'authenticated_account_ledger':
@@ -418,13 +429,56 @@ def evaluate(config, *, now_ms=None, service_probe=probe_services):
                     codes.add('BAR_NOT_CURRENT')
         # Historical last_error, coverage_complete=false, observations=0 and
         # missing trade-fee performance certification are intentionally ignored.
-        return {'healthy': not codes, 'reason_codes': sorted(codes), 'checked_at_ms': now}
+        return {'healthy': not codes, 'reason_codes': sorted(codes), 'checked_at_ms': now,
+                'health_tracking': tracking}
     except MonitorError as exc:
         codes.add(exc.code)
     except Exception:
         codes.add('MONITOR_ERROR')
     return {'healthy': False, 'reason_codes': sorted(codes),
-            'checked_at_ms': int(time.time() * 1000) if now_ms is None else now_ms}
+            'checked_at_ms': int(time.time() * 1000) if now_ms is None else now_ms,
+            'health_tracking': tracking}
+
+
+def _previous_health(config):
+    """Keep the unverified interval across oneshots, errors and restarts."""
+    try:
+        previous = read_status(config)
+    except MonitorError as exc:
+        if exc.code == 'STATE_MISSING':
+            return dict.fromkeys(HEALTH_TRACKING_KEYS)
+        raise MonitorError('MONITOR_STORAGE_ERROR') from None
+    if 'health_tracking' in previous:
+        return previous['health_tracking'].copy()
+    # Conservative migration from the old closed status schema. This only
+    # shortens a pending deadline; it can never certify the current execution.
+    tracking = dict.fromkeys(HEALTH_TRACKING_KEYS)
+    if previous['healthy']:
+        tracking['last_completion_ms'] = previous['checked_at_ms']
+    if previous['delivery'] == 'ping_accepted':
+        tracking['last_ping_accepted_at_ms'] = previous['checked_at_ms']
+    return tracking
+
+
+def _track_health(tracking, service, now):
+    if service.get('health_service_fresh') is True and service.get('health_service_ok') is True:
+        tracking.update(pending_since_ms=None, pending_since_mono_ns=None,
+                        last_completion_ms=now - service.get('health_completion_age_ms', 0))
+        return None
+    mono = time.monotonic_ns()
+    age = service.get('health_pending_age_ms')
+    pending = type(age) is int and 0 <= age < STALE_MS
+    observed_start = now - (age if pending else 0)
+    if tracking['pending_since_ms'] is None:
+        previous_completion = tracking['last_completion_ms']
+        tracking['pending_since_ms'] = min(observed_start, previous_completion or observed_start)
+        tracking['pending_since_mono_ns'] = mono - (age if pending else 0) * 1_000_000
+    wall_age = now - tracking['pending_since_ms']
+    mono_age = (mono - tracking['pending_since_mono_ns']) // 1_000_000
+    # Clock reversal/reboot or repeated new invocations cannot extend a wait.
+    if pending and 0 <= wall_age < STALE_MS and 0 <= mono_age < STALE_MS:
+        return 'HEALTH_CHECK_RUNNING'
+    return 'HEALTH_SERVICE_STALE'
 
 
 def _body(healthy, codes):
@@ -547,13 +601,25 @@ def own_lock(config):
 def read_status(config):
     value = read_json(config.output_dir / 'status.json', 65536)
     # Only our closed schema can be echoed, even if a local file was replaced.
-    if (set(value) != {'version', 'healthy', 'reason_codes', 'checked_at_ms', 'delivery', 'test_notification', 'telegram_delivery_verified'}
+    required = {'version', 'healthy', 'reason_codes', 'checked_at_ms', 'delivery', 'test_notification', 'telegram_delivery_verified'}
+    if (not required <= set(value) or set(value) - required - {'health_tracking'}
             or value['version'] != 1 or type(value['healthy']) is not bool
             or type(value['checked_at_ms']) is not int or type(value['test_notification']) is not bool
             or value['telegram_delivery_verified'] is not False
-            or value['delivery'] not in ('pending', 'ping_accepted', 'failed', 'rate_limited')):
+            or value['delivery'] not in ('pending', 'ping_accepted', 'failed', 'rate_limited', 'deferred')):
         raise MonitorError('STATE_MALFORMED')
     _body(value['healthy'], value['reason_codes'])
+    if 'health_tracking' in value:
+        tracking = value['health_tracking']
+        if (not isinstance(tracking, dict) or set(tracking) != HEALTH_TRACKING_KEYS
+                or any(v is not None and (type(v) is not int or v <= 0) for v in tracking.values())
+                or (tracking['pending_since_ms'] is None) != (tracking['pending_since_mono_ns'] is None)
+                or (value['healthy'] and tracking['pending_since_ms'] is not None)):
+            raise MonitorError('STATE_MALFORMED')
+    if value['delivery'] == 'deferred' and (value['healthy'] or value['test_notification']
+            or value['reason_codes'] != ['HEALTH_CHECK_RUNNING'] or 'health_tracking' not in value
+            or value['health_tracking']['pending_since_ms'] is None):
+        raise MonitorError('STATE_MALFORMED')
     return value
 
 
@@ -607,12 +673,24 @@ def run_once(config, *, test_notification=False, service_probe=probe_services, s
         except MonitorError:
             previous = None
         result = evaluate(config, now_ms=now_ms, service_probe=service_probe)
+        storage_error = 'MONITOR_STORAGE_ERROR' in result['reason_codes']
         if test_notification:
             result.update(healthy=False, reason_codes=['TEST_ALERT'])
         value = {'version': 1, **result, 'delivery': 'pending', 'test_notification': test_notification,
                  'telegram_delivery_verified': False}
+        if storage_error:
+            # Preserve a damaged durable checkpoint for diagnosis. Replacing
+            # it with empty tracking would silently restart the pending clock.
+            value.update(healthy=False, delivery='failed', reason_codes=['MONITOR_STORAGE_ERROR'])
+            return value
+        deferred = not test_notification and value['reason_codes'] == ['HEALTH_CHECK_RUNNING']
+        if deferred:
+            value['delivery'] = 'deferred'
         try:
             _atomic(config.output_dir / 'status.json', value)
+            if deferred:
+                _event(config, value, previous)
+                return value  # Neither Up nor Down: retain the external monitor's state.
             allowed = _reserve_ping(config, value['checked_at_ms'])
         except (OSError, MonitorError):
             value.update(healthy=False, reason_codes=sorted(set(value['reason_codes']) | {'MONITOR_STORAGE_ERROR'}),
@@ -627,6 +705,9 @@ def run_once(config, *, test_notification=False, service_probe=probe_services, s
             except Exception:
                 accepted = False
             value['delivery'] = 'ping_accepted' if accepted is True else 'failed'
+            if accepted is True:
+                value['health_tracking']['last_ping_accepted_at_ms'] = (
+                    int(time.time() * 1000) if now_ms is None else now_ms)
         try:
             _atomic(config.output_dir / 'status.json', value)
             _event(config, value, previous)
@@ -657,6 +738,8 @@ def main(argv=None):
             result = run_once(config, test_notification=args.test_notification)
         print(json.dumps(result, sort_keys=True))
         success = (result.get('config_valid')
+                   or (result.get('delivery') == 'deferred'
+                       and result.get('reason_codes') == ['HEALTH_CHECK_RUNNING'])
                    or (args.test_notification and result.get('delivery') == 'ping_accepted')
                    or (result.get('healthy') and result.get('delivery', 'ping_accepted') == 'ping_accepted'))
         return 0 if success else 1

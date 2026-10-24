@@ -93,7 +93,9 @@ def test_healthy_ignores_historical_errors_fees_and_old_snapshot_mtime(state):
     config, _ = state
     os.utime(config.state_dir / 'snapshot.json', (1, 1))
     result = monitor.evaluate(config, now_ms=NOW, service_probe=probe)
-    assert result == {'healthy': True, 'reason_codes': [], 'checked_at_ms': NOW}
+    assert result['healthy'] is True and result['reason_codes'] == []
+    assert result['checked_at_ms'] == NOW
+    assert set(result) == {'healthy', 'reason_codes', 'checked_at_ms', 'health_tracking'}
     assert 'PRIVATE' not in json.dumps(result) and 'SECRET' not in json.dumps(result)
 
 
@@ -249,7 +251,8 @@ def test_systemd_probe_is_read_only_and_bounded(state, monkeypatch):
         return subprocess.CompletedProcess(args, 0, b'Id=bb-squeeze-live.service\nActiveState=active\nSubState=running\nMainPID=42\n\nId=bb-squeeze-live-health.timer\nActiveState=active\nSubState=waiting\nMainPID=0\n\nId=bb-squeeze-live-health.service\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\nExecMainExitTimestampMonotonic=999999000000\n')
     monkeypatch.setattr(monitor.subprocess, 'run', run)
     monkeypatch.setattr(monitor.time, 'monotonic_ns', lambda: 1_000_000_000_000_000)
-    assert monitor.probe_services(state[0]) == probe(state[0])
+    service = monitor.probe_services(state[0])
+    assert {key: service[key] for key in probe(None)} == probe(state[0])
     assert calls[0][0][0:2] == ['systemctl', 'show'] and calls[0][1]['timeout'] == 5
     assert calls[0][1].get('shell') is None
 
@@ -257,7 +260,7 @@ def test_systemd_probe_is_read_only_and_bounded(state, monkeypatch):
 @pytest.mark.parametrize('active,result,status,age_us,ok,fresh', [
     ('inactive', 'success', 0, 180_000_000, True, True),
     ('inactive', 'success', 0, 180_000_001, True, False),
-    ('activating', 'success', 0, 60_000_000, True, True),
+    ('activating', 'success', 0, 60_000_000, True, False),
     ('activating', 'success', 0, 190_000_000, True, False),
     ('failed', 'exit-code', 1, 1_000_000, False, True),
     ('inactive', 'signal', 9, 1_000_000, False, True),
@@ -316,27 +319,29 @@ def completed_health(clock):
             'ExecMainExitTimestampMonotonic':clock['us'] - 1000}
 
 
-def test_observed_oneshot_race_waits_for_same_success_and_sends_only_up(state, transitioning_health):
-    clock = transitioning_health(lambda c: completed_health(c) if c['us']-c['start'] >= 1_106_264 else {})
+@pytest.mark.parametrize('duration_us', [1_106_264, 2_199_175, 3_300_283])
+def test_observed_oneshot_race_waits_for_same_success_and_sends_only_up(state, transitioning_health, duration_us):
+    clock = transitioning_health(lambda c: completed_health(c) if c['us']-c['start'] >= duration_us else {})
     sent = []
     result = monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services,
                              sender=lambda cfg, healthy, codes: sent.append((healthy,codes)) or True)
     assert result['healthy'] and sent == [(True, [])]
-    assert len(clock['calls']) > 1 and sum(clock['sleeps']) <= 2
+    assert len(clock['calls']) > 1 and sum(clock['sleeps']) <= 5
     assert all(0 < t <= 5 for t in clock['calls'])
 
 
-def test_still_running_never_becomes_healthy_and_does_not_extend_start_deadline(state, transitioning_health):
+def test_normal_running_observation_is_pending_not_a_stale_or_up_decision(state, transitioning_health):
     clock = transitioning_health(lambda c: {})
     service = monitor.probe_services(state[0])
     assert not service['health_service_fresh']
-    assert clock['us'] - clock['start'] <= 2_000_000
+    assert clock['us'] - clock['start'] <= 5_100_000
     assert len(clock['calls']) <= monitor.HEALTH_RECHECKS + 1
-    assert 'HEALTH_SERVICE_STALE' in assess(state, service_probe=lambda _:service)['reason_codes']
+    result = assess(state, service_probe=lambda _:service)
+    assert result['reason_codes'] == ['HEALTH_CHECK_RUNNING'] and not result['healthy']
 
 
 @pytest.mark.parametrize('update', [
-    {'ExecMainStartTimestampMonotonic':999_997_999_999},
+    {'ExecMainStartTimestampMonotonic':999_819_999_999},
     {'ExecMainStartTimestampMonotonic':1_000_000_000_001},
     {'ExecMainStartTimestampMonotonic':0},
     {'ExecMainStartTimestampMonotonic':'invalid'},
@@ -370,7 +375,7 @@ def test_transition_does_not_hide_failure_or_changed_invocation(state, transitio
 def test_timeout_during_recheck_is_not_normal_completion(state, transitioning_health):
     clock = transitioning_health(lambda c:{} if len(c['calls'])==1 else subprocess.TimeoutExpired('systemctl', .5))
     assert assess(state, service_probe=monitor.probe_services)['reason_codes'] == ['SERVICE_UNAVAILABLE']
-    assert len(clock['calls']) == 2 and clock['calls'][1] < 2
+    assert len(clock['calls']) == 2 and clock['calls'][1] < 5
 
 
 def test_first_slow_read_cannot_reset_overall_five_second_budget(state, transitioning_health):
@@ -380,6 +385,132 @@ def test_first_slow_read_cannot_reset_overall_five_second_budget(state, transiti
     clock = transitioning_health(respond)
     assert not monitor.probe_services(state[0])['health_service_fresh']
     assert len(clock['calls']) == 1 and not clock['sleeps']
+
+
+def refresh_observed_state(state, now):
+    """Only test fixtures advance; no production or exchange operation is run."""
+    for document in state[1].values():
+        if 'updated_ms' in document:
+            document['updated_ms'] = now
+        if 'runtime_coverage' in document:
+            document['runtime_coverage']['updated_ms'] = now
+    runner = state[1]['runner_status.json']
+    runner['last_successful_poll_ms'] = runner['last_successful_service_ms'] = now
+    runner['automatic_recovery']['last_cycle_ms'] = now
+    for name, value in state[1].items():
+        write(state[0].state_dir / name, value)
+
+
+def test_running_beyond_short_probe_wait_does_not_send_down_or_unverified_up(state, transitioning_health):
+    clock = transitioning_health(lambda c: {})
+    sent = []
+    result = monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services,
+                             sender=lambda cfg, healthy, codes: sent.append((healthy, codes)) or True)
+    assert result['healthy'] is False and result['reason_codes'] == ['HEALTH_CHECK_RUNNING']
+    assert result['delivery'] == 'deferred' and not sent
+    assert not (state[0].output_dir / 'send-window.json').exists()
+    assert monitor.read_status(state[0]) == result
+    pending = result['health_tracking']
+    assert pending['pending_since_ms'] is not None and pending['pending_since_mono_ns'] is not None
+    assert len(clock['calls']) <= monitor.HEALTH_RECHECKS + 1
+
+
+def test_later_completed_invocation_clears_pending_and_sends_verified_up(state, transitioning_health):
+    clock = transitioning_health(lambda c: {})
+    sent = []
+    sender = lambda cfg, healthy, codes: sent.append((healthy, codes)) or True
+    first = monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services, sender=sender)
+    assert first['delivery'] == 'deferred' and not sent
+    clock['us'] += 30_000_000
+    transitioning_health(lambda c: completed_health(c))
+    refresh_observed_state(state, NOW + 30_000)
+    result = monitor.run_once(state[0], now_ms=NOW + 30_000,
+                              service_probe=monitor.probe_services, sender=sender)
+    assert result['healthy'] and sent == [(True, [])]
+    assert result['health_tracking']['pending_since_ms'] is None
+    assert result['health_tracking']['pending_since_mono_ns'] is None
+    assert result['health_tracking']['last_completion_ms'] is not None
+    assert result['health_tracking']['last_ping_accepted_at_ms'] == NOW + 30_000
+
+
+@pytest.mark.parametrize('mutation,code', [
+    ('HALT', 'STRATEGY_HALTED'), ('ENTRY_PAUSED', 'ENTRIES_PAUSED'),
+    ('EXCHANGE_PAUSED', 'EXCHANGE_PAUSED'), ('unsafe', 'PROTECTION_UNSAFE'),
+    ('unresolved', 'UNRESOLVED_ORDERS'), ('stale_runner', 'STATE_STALE')])
+def test_running_health_does_not_defer_any_real_trading_fault(state, transitioning_health, mutation, code):
+    transitioning_health(lambda c: {})
+    if mutation in ('HALT', 'ENTRY_PAUSED', 'EXCHANGE_PAUSED'):
+        write(state[0].state_dir / mutation, {})
+    elif mutation == 'unsafe':
+        state[1]['report.json']['unsafe_protection'] = {'market': 'unprotected'}
+    elif mutation == 'unresolved':
+        state[1]['snapshot.json']['unresolved_operations'] = {'order': 'unknown'}
+    else:
+        state[1]['runner_status.json']['updated_ms'] = NOW - 180001
+    for name, value in state[1].items():
+        write(state[0].state_dir / name, value)
+    sent = []
+    result = monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services,
+                              sender=lambda cfg, healthy, codes: sent.append((healthy, codes)) or True)
+    assert not result['healthy'] and code in result['reason_codes']
+    assert result['delivery'] == 'ping_accepted' and len(sent) == 1 and sent[0][0] is False
+
+
+def test_pending_then_real_health_failure_sends_down_without_waiting_stale_limit(state, transitioning_health):
+    transitioning_health(lambda c: {})
+    sent = []
+    sender = lambda cfg, healthy, codes: sent.append((healthy, codes)) or True
+    first = monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services, sender=sender)
+    transitioning_health(lambda c: {'ActiveState': 'failed', 'SubState': 'failed',
+                                     'Result': 'exit-code', 'ExecMainStatus': 1})
+    refresh_observed_state(state, NOW + 30_000)
+    result = monitor.run_once(state[0], now_ms=NOW + 30_000,
+                              service_probe=monitor.probe_services, sender=sender)
+    assert 'HEALTH_SERVICE_FAILED' in result['reason_codes']
+    assert result['delivery'] == 'ping_accepted' and sent[0][0] is False and len(sent) == 1
+    assert result['health_tracking']['pending_since_ms'] == first['health_tracking']['pending_since_ms']
+
+
+def test_previous_down_is_not_cleared_by_a_running_health_check(state, transitioning_health):
+    sent = []
+    sender = lambda cfg, healthy, codes: sent.append((healthy, codes)) or True
+    write(state[0].state_dir / 'HALT', {})
+    monitor.run_once(state[0], now_ms=NOW, service_probe=probe, sender=sender)
+    (state[0].state_dir / 'HALT').unlink()
+    transitioning_health(lambda c: {})
+    refresh_observed_state(state, NOW + 30_000)
+    result = monitor.run_once(state[0], now_ms=NOW + 30_000,
+                              service_probe=monitor.probe_services, sender=sender)
+    assert not result['healthy'] and result['delivery'] == 'deferred'
+    assert len(sent) == 1 and sent[0][0] is False
+
+
+def test_pending_deadline_survives_new_health_invocations_and_unrelated_down(state, transitioning_health):
+    clock = transitioning_health(lambda c: {})
+    sent = []
+    sender = lambda cfg, healthy, codes: sent.append((healthy, codes)) or True
+    first = monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services, sender=sender)
+    original = first['health_tracking'].copy()
+    for offset in (30_000, 90_000, 150_000):
+        clock['us'] = 1_000_000_000_000 + offset * 1000
+        clock['start'] = clock['us'] - 100_000
+        refresh_observed_state(state, NOW + offset)
+        if offset == 90_000:
+            write(state[0].state_dir / 'HALT', {})
+        else:
+            (state[0].state_dir / 'HALT').unlink(missing_ok=True)
+        result = monitor.run_once(state[0], now_ms=NOW + offset,
+                                  service_probe=monitor.probe_services, sender=sender)
+        for key in ('pending_since_ms', 'pending_since_mono_ns'):
+            assert result['health_tracking'][key] == original[key]
+    clock['us'] = 1_000_000_000_000 + 181_000_000
+    clock['start'] = clock['us'] - 100_000
+    refresh_observed_state(state, NOW + 181_000)
+    result = monitor.run_once(state[0], now_ms=NOW + 181_000,
+                              service_probe=monitor.probe_services, sender=sender)
+    assert not result['healthy'] and 'HEALTH_SERVICE_STALE' in result['reason_codes']
+    assert result['delivery'] == 'ping_accepted' and sent[-1][0] is False
+    assert all(healthy is False for healthy, _ in sent)
 
 
 @pytest.mark.parametrize('marker', ['HALT', 'ENTRY_PAUSED'])
@@ -505,6 +636,16 @@ def test_explicit_test_cli_success_is_ping_acceptance_not_healthy_up(state, monk
     assert result['healthy'] is False and result['telegram_delivery_verified'] is False
 
 
+def test_pending_cli_is_successfully_observed_but_does_not_claim_healthy_or_delivered(state, monkeypatch, capsys):
+    monkeypatch.setattr(monitor, 'load_config', lambda _: state[0])
+    monkeypatch.setattr(monitor, 'run_once', lambda *args, **kwargs: {
+        'healthy': False, 'reason_codes': ['HEALTH_CHECK_RUNNING'], 'test_notification': False,
+        'delivery': 'deferred', 'telegram_delivery_verified': False})
+    assert monitor.main(['--config', 'unused', '--once']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['healthy'] is False and result['delivery'] == 'deferred'
+
+
 def test_manual_repeats_are_durably_rate_limited(state):
     calls = []
     sender = lambda *args: calls.append(1) or True
@@ -538,6 +679,118 @@ def test_status_refuses_unknown_fields_instead_of_echoing_them(state):
     write(path, saved)
     with pytest.raises(monitor.MonitorError):
         monitor.read_status(state[0])
+
+
+def test_legacy_status_schema_remains_readable_without_inventing_pending_completion(state, transitioning_health):
+    config, _ = state
+    monitor.run_once(config, sender=lambda *args: True, service_probe=probe, now_ms=NOW)
+    path = config.output_dir / 'status.json'
+    previous = json.loads(path.read_text())
+    del previous['health_tracking']
+    write(path, previous)
+    assert monitor.read_status(config) == previous
+    transitioning_health(lambda c: {})
+    refresh_observed_state(state, NOW + 30_000)
+    sent = []
+    result = monitor.run_once(config, now_ms=NOW + 30_000,
+                              service_probe=monitor.probe_services, sender=lambda *args: sent.append(args))
+    assert not result['healthy'] and result['delivery'] == 'deferred' and not sent
+    assert result['health_tracking']['pending_since_ms'] <= NOW
+    assert result['health_tracking']['last_ping_accepted_at_ms'] == NOW
+
+
+@pytest.mark.parametrize('key', ['pending_since_ms', 'pending_since_mono_ns',
+                                 'last_completion_ms', 'last_ping_accepted_at_ms'])
+@pytest.mark.parametrize('invalid', [True, False, 0, -1, 1.5, 'SECRET'])
+def test_health_tracking_values_reject_malformed_or_sensitive_fields(state, key, invalid):
+    config, _ = state
+    monitor.run_once(config, sender=lambda *args: True, service_probe=probe, now_ms=NOW)
+    path = config.output_dir / 'status.json'
+    saved = json.loads(path.read_text())
+    saved['health_tracking'][key] = invalid
+    write(path, saved)
+    with pytest.raises(monitor.MonitorError, match='STATE_MALFORMED'):
+        monitor.read_status(config)
+
+
+@pytest.mark.parametrize('mutation', ['unknown', 'missing', 'half_pending', 'healthy_pending',
+                                     'deferred_without_pending', 'deferred_healthy', 'deferred_fault'])
+def test_health_tracking_and_deferred_status_require_closed_consistent_schema(state, mutation):
+    config, _ = state
+    monitor.run_once(config, sender=lambda *args: True, service_probe=probe, now_ms=NOW)
+    path = config.output_dir / 'status.json'
+    saved = json.loads(path.read_text())
+    tracking = saved['health_tracking']
+    if mutation == 'unknown':
+        tracking['raw_private_diagnostic'] = 'SECRET'
+    elif mutation == 'missing':
+        del tracking['last_completion_ms']
+    elif mutation == 'half_pending':
+        tracking['pending_since_ms'] = NOW
+    elif mutation == 'healthy_pending':
+        tracking.update(pending_since_ms=NOW, pending_since_mono_ns=1)
+    else:
+        saved.update(delivery='deferred', healthy=False, reason_codes=['HEALTH_CHECK_RUNNING'])
+        if mutation != 'deferred_without_pending':
+            tracking.update(pending_since_ms=NOW, pending_since_mono_ns=1)
+        if mutation == 'deferred_healthy':
+            saved['healthy'] = True
+        elif mutation == 'deferred_fault':
+            saved['reason_codes'].append('PROTECTION_UNSAFE')
+    write(path, saved)
+    with pytest.raises(monitor.MonitorError, match='STATE_MALFORMED'):
+        monitor.read_status(config)
+
+
+@pytest.mark.parametrize('test_notification', [False, True])
+def test_corrupt_pending_checkpoint_is_not_overwritten_or_used_to_send_up(state, transitioning_health, test_notification):
+    transitioning_health(lambda c: {})
+    config, _ = state
+    monitor.run_once(config, now_ms=NOW, service_probe=monitor.probe_services,
+                     sender=lambda *args: pytest.fail('pending must not send'))
+    path = config.output_dir / 'status.json'
+    path.write_text('{invalid', encoding='utf-8')
+    before = path.read_bytes()
+    result = monitor.run_once(config, now_ms=NOW + 30_000, service_probe=probe,
+                              test_notification=test_notification,
+                              sender=lambda *args: pytest.fail('corrupt checkpoint must not send'))
+    assert not result['healthy'] and result['delivery'] == 'failed'
+    assert 'MONITOR_STORAGE_ERROR' in result['reason_codes']
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('clock_change', ['wall_reversed', 'monotonic_reboot'])
+def test_pending_does_not_extend_through_clock_reversal_or_reboot(state, transitioning_health, clock_change):
+    clock = transitioning_health(lambda c: {})
+    sent = []
+    sender = lambda cfg, healthy, codes: sent.append((healthy, codes)) or True
+    monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services, sender=sender)
+    now = NOW + 30_000
+    clock['us'] += 30_000_000
+    if clock_change == 'wall_reversed':
+        now = NOW - 30_000
+    else:
+        clock['us'] = 1_000_000
+    clock['start'] = clock['us'] - 100_000
+    refresh_observed_state(state, now)
+    result = monitor.run_once(state[0], now_ms=now, service_probe=monitor.probe_services, sender=sender)
+    assert not result['healthy'] and 'HEALTH_SERVICE_STALE' in result['reason_codes']
+    assert len(sent) == 1 and sent[0][0] is False
+
+
+def test_last_verified_completion_constrains_wait_even_if_new_health_start_is_recent(state, transitioning_health):
+    clock = transitioning_health(lambda c: completed_health(c))
+    sent = []
+    sender = lambda cfg, healthy, codes: sent.append((healthy, codes)) or True
+    monitor.run_once(state[0], now_ms=NOW, service_probe=monitor.probe_services, sender=sender)
+    clock['us'] += 181_000_000
+    clock['start'] = clock['us'] - 100_000
+    transitioning_health(lambda c: {})
+    refresh_observed_state(state, NOW + 181_000)
+    result = monitor.run_once(state[0], now_ms=NOW + 181_000,
+                              service_probe=monitor.probe_services, sender=sender)
+    assert 'HEALTH_SERVICE_STALE' in result['reason_codes'] and not result['healthy']
+    assert len(sent) == 2 and sent[-1][0] is False
 
 
 @pytest.mark.parametrize('offset,current,code', [(180_000, True, None),
