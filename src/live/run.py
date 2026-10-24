@@ -554,6 +554,19 @@ def run_loop(trader, markets, config, deadline: float) -> None:
                         resolution_error = exc
                 try:
                     trader.service(marks={} if poll_failed else None)
+                    if isinstance(trader.broker, StrategyBroker):
+                        # Historical non-dispatch checks cannot delay current
+                        # native-stop/residual management or entry candidates.
+                        now_audit = time.time()
+                        phase_ms = now_audit * 1000 % H4
+                        entry_window = (phase_ms < config.bar_grace_seconds * 1000
+                                        or H4 - phase_ms <= 10_000)
+                        protection_pending = any(getattr(trader, key, None) for key in (
+                            'pending_operation', 'unresolved_operations', 'residual_exits', 'orphan_orders'))
+                        audit_wait = ('poll_failed' if poll_failed else
+                                      'entry_window' if entry_window or getattr(trader, 'deferred_entries', None) else
+                                      'current_protection_pending' if protection_pending else None)
+                        trader.broker.audit_retired_orders(blocked_reason=audit_wait)
                     counters['last_successful_service_ms'] = int(time.time() * 1000)
                     coverage.success('service', int(time.time() * 1000))
                 except Exception as exc:

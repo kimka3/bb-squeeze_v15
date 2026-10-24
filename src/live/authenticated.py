@@ -145,6 +145,7 @@ class LighterTransport:
         scope = hashlib.sha256((network + self.expected_address).encode()).hexdigest()[:24]
         self.budget = RequestBudget(Path(key_file).parent / ('requests-' + scope + '.sqlite'))
         self.request_samples = deque(maxlen=1000)
+        self.read_sample_sequence = 0
         self.read_diagnostics = ReadDiagnostics(Path(key_file).parent / ('api-reads-' + scope + '.jsonl'))
         self.read_diagnostics_error = None
         self._last_read_retry = float('-inf')
@@ -194,6 +195,7 @@ class LighterTransport:
     def _record_read(self, sample):
         sample = sanitize_sample(sample)
         self.request_samples.append(sample)
+        self.read_sample_sequence = getattr(self, 'read_sample_sequence', 0) + 1
         diagnostics = getattr(self, 'read_diagnostics', None)
         if diagnostics is not None:
             try:

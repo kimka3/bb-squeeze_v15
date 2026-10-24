@@ -16,6 +16,7 @@ from .execution import ExecutionEngine, positions
 from .execution_evidence import Intent, NotSubmitted, UnverifiedExecution, number, verify_order, verify_stop
 from .live_check import price_tick
 from .request_budget import RequestDeferred
+from .order_lookup_audit import RetiredOrderAudit
 
 
 class StrategyBroker:
@@ -30,10 +31,13 @@ class StrategyBroker:
         self.db=self.engine.store.db
         self.db.execute('CREATE TABLE IF NOT EXISTS bindings(coi TEXT PRIMARY KEY,value TEXT)')
         self.db.commit()
+        self.retired_order_audit = RetiredOrderAudit(self.db, clock)
         self.ledger=AccountLedger(self.engine.directory/'account-ledger.sqlite',transport.network,transport.account_index,start_ms)
         self._marks={}; self._mark_sample_ms={}
         self.by_id={m.market_id:(s,m) for s,m in markets.items()}
         self.last_report={}
+        self._retired_candidates = None
+        self._retired_audit_wait = 'no_current_reconciliation'
         self.entry_guard=None
         self.initial_allocated_equity=None
         self._entry_state=None
@@ -44,6 +48,7 @@ class StrategyBroker:
 
     def _write(self):
         self._entry_state=None
+        self._retired_candidates = None
         if not self.writes_enabled: raise RuntimeError('strategy writes disabled')
 
     def offer_entry_state(self, state):
@@ -154,6 +159,7 @@ class StrategyBroker:
         return True
 
     def _create_order(self,intent,market,**options):
+        self._retired_candidates = None
         try:
             return self.engine.create(intent,market.size_decimals,market.price_decimals,**options)
         except NotSubmitted:
@@ -266,6 +272,7 @@ class StrategyBroker:
         return self.market_order_result(coi)
 
     def market_order_result(self,coi):
+        self._retired_candidates = None
         binding=self._bindings().get(coi)
         if not binding: return None
         stored=self.engine.store.load(coi)
@@ -345,6 +352,7 @@ class StrategyBroker:
             if not details['retryable']: raise NotSubmitted(details['reason'])
             try: self._verified_exposure(market,side,qty)
             except Exception as exc: self._not_sent(exc)
+        self._retired_candidates = None
         self.engine.amend_stop(ref.client_order_index,replacement,market.size_decimals,market.price_decimals,
                               retry_not_submitted=retry)
 
@@ -359,6 +367,7 @@ class StrategyBroker:
             if not details['retryable']: raise NotSubmitted(details['reason'])
             try: self._verified_exposure(market,binding['side'],0,flat_allowed=True)
             except Exception as exc: self._not_sent(exc)
+        self._retired_candidates = None
         self.engine.cancel(ref.client_order_index,retry_not_submitted=retry)
 
     def account_state(self):
@@ -367,6 +376,18 @@ class StrategyBroker:
         # reconciliation. Unknown submissions and identity/schema failures do
         # not qualify; exceptions, including budget cooldown, propagate.
         self._entry_state=None
+        self._retired_candidates = None
+        try:
+            self.retired_order_audit.check_latched()
+            return self._reconciled_account_state()
+        except Exception:
+            self._retired_candidates = None
+            # A newly discovered contradiction must remain visible even when
+            # no successful AccountState was produced (including after restart).
+            self.last_report['retired_order_audit'] = self.retired_order_audit.report()
+            raise
+
+    def _reconciled_account_state(self):
         already_waiting=self.last_report.get('publication_pending',False)
         for attempt in (1,2):
             state,read_mismatch=self._account_state_once()
@@ -389,6 +410,7 @@ class StrategyBroker:
             active_by_coi[coi]=row
         bindings=self._bindings(); results={}; intents={}; expected={}; tp_done={}; costs={}
         superseded = self._superseded_stops(bindings)
+        retired_candidates = {}
         unresolved={}; not_submitted={}; unverified_markets=set(); read_mismatches=set()
         unknown_ownership=False
         publication_evidence=[]; hard_markets=set(); cycle_exposure={}
@@ -408,12 +430,26 @@ class StrategyBroker:
                     or cycle.get('side')!=b['side'] or (b['role']=='ENTRY' and b['cycle']!=coi)):
                 raise UnverifiedExecution('owned order cycle identity differs')
             intents[coi]=intent
+            unsent = self.engine.store.known_not_submitted(coi)
+            detail = self.engine.store.submission_details(coi) if unsent else None
+            # Only IDs that this adapter cannot send again may leave the hot
+            # path. Live retryable protection/exits and ALL ambiguous IDs keep
+            # their immediate query. Absence never creates terminal evidence.
+            if unsent:
+                if old is not None:
+                    raise UnverifiedExecution('non-submission conflicts with stored order result')
+                classification = ('superseded_stop' if coi in superseded else
+                                  'unsent_entry' if b['role']=='ENTRY' else
+                                  'nonretryable_unsent' if not detail['retryable'] else None)
+                if classification:
+                    retired_candidates[coi] = {'classification': classification}
             row=active_by_coi.get(coi)
-            if row is None and not (old and old['terminal']): row=self.transport.order(coi)
-            if self.engine.store.known_not_submitted(coi):
+            if row is None and not (old and old['terminal']) and coi not in retired_candidates:
+                row=self.retired_order_audit.lookup(coi, self.transport)
+            if unsent:
                 if row is not None:
+                    self.retired_order_audit.observe_conflict(coi, 'active' if coi in active_by_coi else 'foreground')
                     raise UnverifiedExecution('exchange order conflicts with confirmed local non-submission')
-                detail=self.engine.store.submission_details(coi)
                 not_submitted[str(coi)]=diagnostic(coi,detail['reason'],retryable=detail['retryable'])
                 if coi in superseded:
                     not_submitted[str(coi)]['superseded_by'] = superseded[coi]['new_coi']
@@ -484,6 +520,7 @@ class StrategyBroker:
             if any(r['market_id']!=intent.market_index or r['is_ask']!=intent.is_ask for r in rows):
                 raise UnverifiedExecution('trade side/market differs from owned intent')
             if str(coi) in not_submitted and rows:
+                self.retired_order_audit.observe_conflict(coi, 'trade')
                 raise UnverifiedExecution('trade conflicts with confirmed local non-submission')
             if result and any(r['order_index']!=result['order_index'] for r in rows):
                 raise UnverifiedExecution('trade/exchange order identity mismatch')
@@ -675,8 +712,23 @@ class StrategyBroker:
                               risk_equity_source='fresh account equity capped at approved initial capital; protection only')
         candidate=(bool(read_mismatches) and not unknown_ownership and not unresolved
                    and unverified_markets<=read_mismatches and not historical_blocked)
+        # The loop performs optional reads only AFTER Trader.service has managed
+        # current protection/residuals. A successful ownership check alone does
+        # not establish that the required native stop is still present.
+        self._retired_candidates = retired_candidates
+        self._retired_audit_wait = 'current_reconciliation_pending' if not verified else None
+        report['retired_order_audit'] = self.retired_order_audit.report(retired_candidates)
         return (AccountState(float(equity),float(maintenance),out,active_map,
                              verified,True,report),candidate)
+
+    def audit_retired_orders(self, *, blocked_reason=None):
+        """Bounded read-only maintenance, called after current risk service."""
+        wait = (blocked_reason or ('entry_window' if self.entry_deadline_ms is not None else None)
+                or ('no_current_reconciliation' if self._retired_candidates is None else self._retired_audit_wait))
+        try:
+            self.retired_order_audit.run(self._retired_candidates or {}, self.transport, blocked_reason=wait)
+        finally:
+            self.last_report['retired_order_audit'] = self.retired_order_audit.report(self._retired_candidates)
 
     def poll(self):
         data=self.transport.get('/api/v1/orderBookDetails')

@@ -151,6 +151,7 @@ def test_resolution_hooks_run_inside_writer_in_protection_order(tmp_path, monkey
         def poll(self):
             stage('poll')
             return []
+        def audit_retired_orders(self, *, blocked_reason=None): pass
     monkeypatch.setattr(run, 'StrategyBroker', Broker)
     class Controller:
         def failure(self, exc, stream): calls.append(('failure', stream))

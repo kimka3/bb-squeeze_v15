@@ -293,6 +293,7 @@ def test_loop_reports_failures_and_counts_cycles_only_after_poll_and_service(tmp
             events.append('poll')
             if failure_stage == 'poll' and counts['poll'] == 1: raise temporary_error()
             return []
+        def audit_retired_orders(self, *, blocked_reason=None): pass
     monkeypatch.setattr(run, 'StrategyBroker', Broker)
     class Recovery:
         def failure(self, error, stream): events.append(('failure', stream))
