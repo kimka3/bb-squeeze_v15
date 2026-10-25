@@ -1,0 +1,132 @@
+//@version=6
+strategy(
+     title = "4H SMA720 Adaptive ATR | 2X Long Only | SMA240 or SMA720 Exit",
+     shorttitle = "AATR-L2X-S240|720",
+     overlay = true,
+     initial_capital = 100000,
+     currency = currency.USD,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 200,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.1,
+     slippage = 0,
+     process_orders_on_close = false,
+     calc_on_order_fills = false,
+     calc_on_every_tick = false,
+     margin_long = 1.2,
+     margin_short = 1.2,
+     max_bars_back = 1200
+ )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// "AATR-L2X-S720" 롱 전용 버전에 E안 청산을 적용한 버전
+//
+// 롱 진입 = 무포지션일 때 4H 종가가 아래 진입선을 상향 교차
+//   SMA720 상승 (현재 > 30봉 전) : SMA720 + 0.75 ATR
+//   SMA720 하락·보합              : SMA720 + 1.25 ATR
+// 롱 청산 (E안) = 4H 종가가 SMA240 을 하향 교차  또는  SMA720 을 하향 교차
+//   - SMA240 만 쓰면, 진입 시 종가가 이미 SMA240 아래일 때 하향 교차가
+//     나오지 않아 손실이 방치된다. SMA720 하향 교차를 함께 두어 이를 막는다.
+// 진입·청산 체결 = 신호 다음 4시간봉 시가
+//
+// 참고: 레포의 바이낸스 선물 4H 데이터 (2021-03 ~ 2026-08) 로 재현한 백테스트에서
+// BTCUSDT 결과는 원본 CAGR 53% / MDD -51%, E안 CAGR 67% / MDD -45% (펀딩 미반영)였다.
+// TradingView 결과와의 일치는 확인하지 않았다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+string GROUP_ENTRY = "진입 설정"
+string GROUP_EXIT = "청산 설정"
+string GROUP_PERIOD = "백테스트 기간"
+string GROUP_DISPLAY = "표시 설정"
+
+int entrySmaLength = input.int(defval = 720, title = "진입·롱 청산 SMA 길이", minval = 2, group = GROUP_ENTRY)
+int atrLength = input.int(defval = 20, title = "ATR 길이", minval = 1, group = GROUP_ENTRY)
+int slopeLookback = input.int(defval = 30, title = "SMA 기울기 비교 봉 수", minval = 1, group = GROUP_ENTRY)
+float trendAtrMultiple = input.float(defval = 0.75, title = "SMA 상승 시 롱 진입 ATR 배수", minval = 0.0, step = 0.05, group = GROUP_ENTRY)
+float counterTrendAtrMultiple = input.float(defval = 1.25, title = "SMA 하락·보합 시 롱 진입 ATR 배수", minval = 0.0, step = 0.05, group = GROUP_ENTRY)
+
+bool useFastExit = input.bool(defval = true, title = "빠른 SMA 청산 사용 (끄면 원본 SMA720 청산만)", group = GROUP_EXIT)
+int fastExitSmaLength = input.int(defval = 240, title = "빠른 청산 SMA 길이", minval = 2, group = GROUP_EXIT)
+
+// 숫자 리터럴을 사용해 input.time의 const int 오류를 방지합니다.
+int startTime = input.time(defval = 1577836800000, title = "백테스트 시작일", group = GROUP_PERIOD)
+int endTime = input.time(defval = 4102444799000, title = "백테스트 종료일", group = GROUP_PERIOD)
+
+bool showEntryBands = input.bool(defval = false, title = "롱 진입선 표시", group = GROUP_DISPLAY)
+bool showFastExitSma = input.bool(defval = true, title = "빠른 청산 SMA 표시", group = GROUP_DISPLAY)
+bool showSignalMarks = input.bool(defval = true, title = "신호 표시", group = GROUP_DISPLAY)
+bool showPositionBackground = input.bool(defval = true, title = "포지션 배경 표시", group = GROUP_DISPLAY)
+
+bool isFourHourChart = timeframe.in_seconds() == 14400
+if barstate.isfirst and not isFourHourChart
+    runtime.error("이 전략은 반드시 4시간봉 차트에서 사용해야 합니다.")
+
+float entrySma = ta.sma(close, entrySmaLength)
+float fastExitSma = ta.sma(close, fastExitSmaLength)
+float atrValue = ta.atr(atrLength)
+bool smaRising = entrySma > entrySma[slopeLookback]
+
+float longAtrMultiple = smaRising ? trendAtrMultiple : counterTrendAtrMultiple
+float longEntryBand = entrySma + longAtrMultiple * atrValue
+
+bool crossedLongBand = ta.crossover(close, longEntryBand)
+bool crossedSlowExitDown = ta.crossunder(close, entrySma)
+bool crossedFastExitDown = useFastExit and ta.crossunder(close, fastExitSma)
+bool inDateRange = time >= startTime and time <= endTime
+
+bool longEntrySignal = barstate.isconfirmed and inDateRange and crossedLongBand and strategy.position_size == 0
+bool longExitSignal = barstate.isconfirmed and inDateRange and (crossedFastExitDown or crossedSlowExitDown) and strategy.position_size > 0
+
+// 같은 봉에서 둘 다 교차하면 SMA720 쪽으로 표기합니다.
+string exitComment = crossedSlowExitDown ? "EXIT LONG: SMA720 Down" : "EXIT LONG: SMA" + str.tostring(fastExitSmaLength) + " Down"
+string exitAlert = crossedSlowExitDown ? "{\"action\":\"CLOSE_LONG\",\"reason\":\"LONG_SMA720_EXIT\"}" : "{\"action\":\"CLOSE_LONG\",\"reason\":\"LONG_FAST_SMA_EXIT\"}"
+
+if longEntrySignal
+    strategy.entry(
+         id = "Long",
+         direction = strategy.long,
+         comment = "LONG: Adaptive ATR",
+         alert_message = "{\"action\":\"BUY\",\"side\":\"LONG\",\"reason\":\"ADAPTIVE_ATR\"}"
+     )
+
+if longExitSignal
+    strategy.close(
+         id = "Long",
+         comment = exitComment,
+         alert_message = exitAlert
+     )
+
+if time > endTime and strategy.position_size != 0
+    strategy.close_all(
+         comment = "EXIT: Test End",
+         alert_message = "{\"action\":\"CLOSE_ALL\",\"reason\":\"TEST_END\"}"
+     )
+
+bool longExecution = strategy.position_size > 0 and nz(strategy.position_size[1]) <= 0
+bool flatExecution = strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+
+plot(series = entrySma, title = "SMA720_ENTRY_EXIT", color = color.orange, linewidth = 2)
+plot(series = useFastExit and showFastExitSma ? fastExitSma : na, title = "FAST_EXIT_SMA", color = color.fuchsia, linewidth = 1)
+plot(series = showEntryBands ? longEntryBand : na, title = "LONG_ENTRY_BAND", color = color.aqua, linewidth = 1)
+
+plotshape(series = showSignalMarks and longEntrySignal, title = "LONG_SIGNAL_NEXT_OPEN", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny, text = "LONG")
+plotshape(series = showSignalMarks and longExitSignal and crossedSlowExitDown, title = "LONG_EXIT_SMA720_NEXT_OPEN", style = shape.xcross, location = location.abovebar, color = color.orange, size = size.tiny, text = "XL720")
+plotshape(series = showSignalMarks and longExitSignal and not crossedSlowExitDown, title = "LONG_EXIT_FAST_SMA_NEXT_OPEN", style = shape.xcross, location = location.abovebar, color = color.fuchsia, size = size.tiny, text = "XLF")
+plotshape(series = showSignalMarks and longExecution, title = "LONG_EXECUTION", style = shape.circle, location = location.belowbar, color = color.green, size = size.tiny, text = "L")
+plotshape(series = showSignalMarks and flatExecution, title = "FLAT_EXECUTION", style = shape.circle, location = location.top, color = color.gray, size = size.tiny, text = "X")
+
+bgcolor(color = showPositionBackground and strategy.position_size > 0 ? color.new(color.green, 92) : na, title = "POSITION_BACKGROUND")
+
+// 데이터 윈도우용 값
+plot(atrValue, "ATR", display = display.data_window)
+plot(smaRising ? 1 : -1, "SMA720_SLOPE_CODE", display = display.data_window)
+plot(longEntryBand, "LONG_ENTRY_PRICE", display = display.data_window)
+plot(fastExitSma, "FAST_EXIT_SMA_PRICE", display = display.data_window)
+plot(longEntrySignal ? 1 : 0, "ENTRY_SIGNAL_CODE", display = display.data_window)
+plot(longExitSignal ? (crossedSlowExitDown ? 2 : 1) : 0, "EXIT_SIGNAL_CODE (1=FAST,2=SMA720)", display = display.data_window)
+plot(strategy.position_size > 0 ? 1 : 0, "POSITION_CODE", display = display.data_window)
+
+alertcondition(condition = longEntrySignal, title = "Adaptive ATR Long Signal", message = "4H Adaptive ATR LONG: 다음 봉 시가 롱 진입.")
+alertcondition(condition = longExitSignal and not crossedSlowExitDown, title = "Fast SMA Long Exit", message = "4H 빠른 청산 SMA 하향돌파: 다음 봉 시가 롱 청산.")
+alertcondition(condition = longExitSignal and crossedSlowExitDown, title = "SMA720 Long Exit", message = "4H SMA720 하향돌파: 다음 봉 시가 롱 청산.")
