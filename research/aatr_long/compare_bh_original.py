@@ -2,8 +2,8 @@
 
 1) 4H 레포 데이터 (Binance 선물, 2021-03-08 ~ 2026-08-31): Pine 규칙 그대로 재현
 2) 일봉 근사 (Alpha Vantage BTC/USD 일봉 CSV 경로를 인자로): 2018 ~ 2026-10 로 기간을 넓혀
-   시작 시점 민감도를 본다. SMA720(4H)→SMA120(일), ATR 은 4H/일 비율 0.413 으로 보정.
-사용: python3 research/aatr_long/compare_bh_original.py <btc_daily.csv>
+   시작 시점 민감도를 본다. SMA720(4H)→SMA120(일), ATR 은 겹치는 기간의 4H ATR20/일봉 ATR20 중앙값 비율로 보정.
+사용: python3 research/aatr_long/compare_bh_original.py <daily.csv> [SYMBOL=BTCUSDT]
 """
 import sys
 from pathlib import Path
@@ -29,7 +29,8 @@ def stats(t, eq):
 
 # ── 1) 4H 레포 데이터
 START = int(pd.Timestamp('2021-03-08', tz='UTC').timestamp() * 1000)
-d4 = load('BTCUSDT')
+SYMBOL = sys.argv[2] if len(sys.argv) > 2 else 'BTCUSDT'
+d4 = load(SYMBOL)
 rows = []
 for lev in (1.0, 2.0):
     m, _, _ = run(d4, start=START, lev=lev)
@@ -40,7 +41,7 @@ for lev in (1, 2):
     m = buy_hold(d4, lev, START); mf = buy_hold(d4, lev, START, funding=True)
     rows.append(dict(strategy=f'BH {lev}x', cagr=m['cagr'], mdd=m['mdd'], mar=m['mar'], sharpe=m['sharpe'],
                      exposure=1.0, cagr_funding=mf['cagr'] if lev > 1 else m['cagr']))
-print('# 1) 4H 레포 BTC 2021-03-08 ~ 2026-08-31')
+print(f'# 1) 4H 레포 {SYMBOL} 2021-03-08 ~ 2026-08-31')
 print(pd.DataFrame(rows).to_string(index=False, float_format=f))
 
 # ── 2) 일봉 근사
@@ -49,7 +50,13 @@ D = D[D.timestamp >= '2016-06-01'].reset_index(drop=True)
 o, h, l, c = (D[k].to_numpy(float) for k in ['open', 'high', 'low', 'close'])
 pc = np.r_[np.nan, c[:-1]]
 tr = np.where(np.isnan(pc), h - l, np.maximum.reduce([h - l, np.abs(h - pc), np.abs(l - pc)]))
-atr = rma(tr, 20) * 0.413
+c4 = d4.close.to_numpy(); p4 = np.r_[np.nan, c4[:-1]]
+h4, l4 = d4.high.to_numpy(), d4.low.to_numpy()
+tr4 = np.where(np.isnan(p4), h4 - l4, np.maximum.reduce([h4 - l4, np.abs(h4 - p4), np.abs(l4 - p4)]))
+a4 = pd.Series(rma(tr4, 20), index=pd.to_datetime(d4.time, unit='ms').dt.normalize()).groupby(level=0).last()
+ratio = float((a4 / pd.Series(rma(tr, 20), index=D.timestamp).reindex(a4.index)).median())
+print(f'\nATR 보정 비율 (4H/일봉): {ratio:.3f}')
+atr = rma(tr, 20) * ratio
 s720 = pd.Series(c).rolling(120).mean().to_numpy()
 band = s720 + np.where(s720 > np.r_[np.full(5, np.nan), s720[:-5]], 0.75, 1.25) * atr
 ent, xs = cross_over(c, band), cross_under(c, s720)
