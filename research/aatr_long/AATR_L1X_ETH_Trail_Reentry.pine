@@ -1,0 +1,181 @@
+//@version=6
+strategy(
+     title = "4H SMA720 Adaptive ATR | 1X Long Only | SMA720 Exit + Trail & Re-entry",
+     shorttitle = "AATR-L1X-TRL",
+     overlay = true,
+     initial_capital = 100000,
+     currency = currency.USD,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.1,
+     slippage = 0,
+     process_orders_on_close = false,
+     calc_on_order_fills = false,
+     calc_on_every_tick = false,
+     margin_long = 1.2,
+     margin_short = 1.2,
+     max_bars_back = 1200
+ )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 원본 "AATR-L2X-S720" 에 트레일 청산과 재진입을 더한 ETH 용 1배 버전
+//
+// 롱 진입 = 무포지션일 때 4H 종가가 아래 진입선을 상향 교차
+//   SMA720 상승 (현재 > 30봉 전) : SMA720 + 0.75 ATR
+//   SMA720 하락·보합              : SMA720 + 1.25 ATR
+// 롱 청산 = ① 4H 종가가 SMA720 을 하향 교차 (원본)
+//           ② 4H 종가가 진입 이후 최고 종가보다 트레일 % 이상 낮음 (추가)
+// 재진입 = ② 로 청산된 뒤 무포지션이고, 종가가 진입선 위이며,
+//          종가가 직전 N 봉 최고 종가를 넘으면 다시 롱 (추가)
+//          그 사이 종가가 SMA720 을 하향 교차하면 재진입 대기를 끝내고 원본 진입 규칙만 따른다
+// 진입·청산 체결 = 신호 다음 4시간봉 시가
+//
+// 레포 엔진 (Binance 현물 4H) 기준 ETHUSDT 2017-08-18 ~ 2026-10-26:
+//   원본 1x       총 +2,077%  평가손익 기준 MDD -58.4%
+//   트레일 20%    총 +2,576%  평가손익 기준 MDD -48.0%   (재진입 180봉)
+//   트레일 15%    총 +2,168%  평가손익 기준 MDD -45.3%   (재진입 180봉)
+// TradingView 의 '최대 손실폭' 은 청산 거래 기준이라 세 경우 모두 약 35% 로 같게 나온다.
+// 평가손익 기준 MDD 는 오른쪽 위 표 (자산 = strategy.equity, 4H 종가 기준) 로 확인한다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+string GROUP_ENTRY = "진입 설정"
+string GROUP_EXIT = "트레일·재진입 설정"
+string GROUP_PERIOD = "백테스트 기간"
+string GROUP_DISPLAY = "표시 설정"
+
+int entrySmaLength = input.int(defval = 720, title = "진입·롱 청산 SMA 길이", minval = 2, group = GROUP_ENTRY)
+int atrLength = input.int(defval = 20, title = "ATR 길이", minval = 1, group = GROUP_ENTRY)
+int slopeLookback = input.int(defval = 30, title = "SMA 기울기 비교 봉 수", minval = 1, group = GROUP_ENTRY)
+float trendAtrMultiple = input.float(defval = 0.75, title = "SMA 상승 시 롱 진입 ATR 배수", minval = 0.0, step = 0.05, group = GROUP_ENTRY)
+float counterTrendAtrMultiple = input.float(defval = 1.25, title = "SMA 하락·보합 시 롱 진입 ATR 배수", minval = 0.0, step = 0.05, group = GROUP_ENTRY)
+
+bool useTrail = input.bool(defval = true, title = "트레일 청산 사용 (끄면 원본과 같음)", group = GROUP_EXIT)
+float trailPercent = input.float(defval = 20.0, title = "트레일 폭 (진입 후 최고 종가 대비 %)", minval = 1.0, step = 1.0, group = GROUP_EXIT)
+bool useReentry = input.bool(defval = true, title = "트레일 청산 뒤 재진입 사용", group = GROUP_EXIT)
+int reentryLookback = input.int(defval = 180, title = "재진입 신고가 기준 봉 수 (180봉 = 30일)", minval = 2, group = GROUP_EXIT)
+
+// 숫자 리터럴을 사용해 input.time의 const int 오류를 방지합니다.
+int startTime = input.time(defval = 1577836800000, title = "백테스트 시작일", group = GROUP_PERIOD)
+int endTime = input.time(defval = 4102444799000, title = "백테스트 종료일", group = GROUP_PERIOD)
+
+bool showEntryBands = input.bool(defval = false, title = "롱 진입선 표시", group = GROUP_DISPLAY)
+bool showTrailLine = input.bool(defval = true, title = "트레일 청산선 표시", group = GROUP_DISPLAY)
+bool showSignalMarks = input.bool(defval = true, title = "신호 표시", group = GROUP_DISPLAY)
+bool showPositionBackground = input.bool(defval = true, title = "포지션 배경 표시", group = GROUP_DISPLAY)
+bool showDrawdownTable = input.bool(defval = true, title = "평가손익 기준 MDD 표 표시", group = GROUP_DISPLAY)
+
+bool isFourHourChart = timeframe.in_seconds() == 14400
+if barstate.isfirst and not isFourHourChart
+    runtime.error("이 전략은 반드시 4시간봉 차트에서 사용해야 합니다.")
+
+float entrySma = ta.sma(close, entrySmaLength)
+float atrValue = ta.atr(atrLength)
+bool smaRising = entrySma > entrySma[slopeLookback]
+
+float longAtrMultiple = smaRising ? trendAtrMultiple : counterTrendAtrMultiple
+float longEntryBand = entrySma + longAtrMultiple * atrValue
+
+bool crossedLongBand = ta.crossover(close, longEntryBand)
+bool crossedLongExitSmaDown = ta.crossunder(close, entrySma)
+float priorHighestClose = ta.highest(close, reentryLookback)[1]
+bool inDateRange = time >= startTime and time <= endTime
+
+// 진입 이후 최고 종가 (신호봉 종가부터 포함). 포지션이 없으면 na.
+var float peakClose = na
+if strategy.position_size > 0
+    peakClose := na(peakClose) ? math.max(close[1], close) : math.max(peakClose, close)
+else
+    peakClose := na
+
+// 트레일로 청산된 뒤 재진입을 기다리는 상태
+var bool awaitingReentry = false
+
+float trailStop = useTrail and not na(peakClose) ? peakClose * (1 - trailPercent / 100) : na
+bool trailHit = useTrail and not na(trailStop) and close < trailStop
+
+bool isFlat = strategy.position_size == 0
+bool reentryCondition = useTrail and useReentry and awaitingReentry and close > longEntryBand and close > priorHighestClose
+
+bool longEntrySignal = barstate.isconfirmed and inDateRange and isFlat and (crossedLongBand or reentryCondition)
+bool longExitSignal = barstate.isconfirmed and inDateRange and strategy.position_size > 0 and (crossedLongExitSmaDown or trailHit)
+bool exitByTrail = longExitSignal and not crossedLongExitSmaDown
+bool entryByReentry = longEntrySignal and not crossedLongBand
+
+if longEntrySignal
+    strategy.entry(
+         id = "Long",
+         direction = strategy.long,
+         comment = entryByReentry ? "LONG: Re-entry" : "LONG: Adaptive ATR",
+         alert_message = entryByReentry ? "{\"action\":\"BUY\",\"side\":\"LONG\",\"reason\":\"TRAIL_REENTRY\"}" : "{\"action\":\"BUY\",\"side\":\"LONG\",\"reason\":\"ADAPTIVE_ATR\"}"
+     )
+
+if longExitSignal
+    strategy.close(
+         id = "Long",
+         comment = exitByTrail ? "EXIT LONG: Trail " + str.tostring(trailPercent) + "%" : "EXIT LONG: SMA720 Down",
+         alert_message = exitByTrail ? "{\"action\":\"CLOSE_LONG\",\"reason\":\"LONG_TRAIL_EXIT\"}" : "{\"action\":\"CLOSE_LONG\",\"reason\":\"LONG_SMA_EXIT\"}"
+     )
+
+if time > endTime and strategy.position_size != 0
+    strategy.close_all(
+         comment = "EXIT: Test End",
+         alert_message = "{\"action\":\"CLOSE_ALL\",\"reason\":\"TEST_END\"}"
+     )
+
+// 재진입 대기 상태 갱신 (신호 판정 뒤)
+if longExitSignal
+    awaitingReentry := exitByTrail
+if longEntrySignal
+    awaitingReentry := false
+if isFlat and crossedLongExitSmaDown
+    awaitingReentry := false
+
+bool longExecution = strategy.position_size > 0 and nz(strategy.position_size[1]) <= 0
+bool flatExecution = strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+
+// 평가손익 기준 MDD (strategy.equity 는 보유 포지션 평가손익 포함, 4H 종가 기준)
+var float equityPeak = na
+var float maxDrawdownPct = 0.0
+if inDateRange
+    equityPeak := na(equityPeak) ? strategy.equity : math.max(equityPeak, strategy.equity)
+    maxDrawdownPct := math.min(maxDrawdownPct, strategy.equity / equityPeak - 1)
+float currentDrawdownPct = na(equityPeak) ? na : strategy.equity / equityPeak - 1
+
+plot(series = entrySma, title = "SMA720_LONG_EXIT", color = color.orange, linewidth = 2)
+plot(series = showEntryBands ? longEntryBand : na, title = "LONG_ENTRY_BAND", color = color.aqua, linewidth = 1)
+plot(series = showTrailLine ? trailStop : na, title = "TRAIL_STOP", color = color.red, linewidth = 1, style = plot.style_linebr)
+
+plotshape(series = showSignalMarks and longEntrySignal and not entryByReentry, title = "LONG_SIGNAL_NEXT_OPEN", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny, text = "LONG")
+plotshape(series = showSignalMarks and entryByReentry, title = "REENTRY_SIGNAL_NEXT_OPEN", style = shape.triangleup, location = location.belowbar, color = color.teal, size = size.tiny, text = "RE")
+plotshape(series = showSignalMarks and longExitSignal and not exitByTrail, title = "LONG_EXIT_SIGNAL_NEXT_OPEN", style = shape.xcross, location = location.abovebar, color = color.orange, size = size.tiny, text = "XL720")
+plotshape(series = showSignalMarks and exitByTrail, title = "TRAIL_EXIT_SIGNAL_NEXT_OPEN", style = shape.xcross, location = location.abovebar, color = color.red, size = size.tiny, text = "XTR")
+plotshape(series = showSignalMarks and longExecution, title = "LONG_EXECUTION", style = shape.circle, location = location.belowbar, color = color.green, size = size.tiny, text = "L")
+plotshape(series = showSignalMarks and flatExecution, title = "FLAT_EXECUTION", style = shape.circle, location = location.top, color = color.gray, size = size.tiny, text = "X")
+
+bgcolor(color = showPositionBackground and strategy.position_size > 0 ? color.new(color.green, 92) : showPositionBackground and awaitingReentry ? color.new(color.yellow, 94) : na, title = "POSITION_BACKGROUND")
+
+var table ddTable = table.new(position.top_right, 2, 3, bgcolor = color.new(color.black, 20), border_width = 1)
+if showDrawdownTable and barstate.islast
+    table.cell(ddTable, 0, 0, "평가손익 기준", text_color = color.white)
+    table.cell(ddTable, 1, 0, "4H 종가", text_color = color.white)
+    table.cell(ddTable, 0, 1, "최대 낙폭", text_color = color.white)
+    table.cell(ddTable, 1, 1, str.tostring(maxDrawdownPct * 100, "#.##") + "%", text_color = color.red)
+    table.cell(ddTable, 0, 2, "현재 낙폭", text_color = color.white)
+    table.cell(ddTable, 1, 2, str.tostring(nz(currentDrawdownPct) * 100, "#.##") + "%", text_color = color.orange)
+
+// 데이터 윈도우용 값
+plot(atrValue, "ATR", display = display.data_window)
+plot(longEntryBand, "LONG_ENTRY_PRICE", display = display.data_window)
+plot(peakClose, "PEAK_CLOSE_SINCE_ENTRY", display = display.data_window)
+plot(trailStop, "TRAIL_STOP_PRICE", display = display.data_window)
+plot(priorHighestClose, "REENTRY_HIGH_LEVEL", display = display.data_window)
+plot(awaitingReentry ? 1 : 0, "AWAITING_REENTRY", display = display.data_window)
+plot(currentDrawdownPct * 100, "EQUITY_DRAWDOWN_PCT", display = display.data_window)
+plot(maxDrawdownPct * 100, "MAX_EQUITY_DRAWDOWN_PCT", display = display.data_window)
+
+alertcondition(condition = longEntrySignal and not entryByReentry, title = "Adaptive ATR Long Signal", message = "4H Adaptive ATR LONG: 다음 봉 시가 롱 진입.")
+alertcondition(condition = entryByReentry, title = "Trail Re-entry Signal", message = "4H 트레일 청산 후 신고가 재진입: 다음 봉 시가 롱 진입.")
+alertcondition(condition = longExitSignal and not exitByTrail, title = "SMA720 Long Exit", message = "4H SMA720 하향돌파: 다음 봉 시가 롱 청산.")
+alertcondition(condition = exitByTrail, title = "Trail Long Exit", message = "4H 트레일 청산: 다음 봉 시가 롱 청산.")
