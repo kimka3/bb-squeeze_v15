@@ -73,10 +73,10 @@ def cross_under(a, b):
 
 
 def run(d, tp=None, exit_len=720, either=False, start=None, end=None,
-        lev=2.0, fee=0.001, cap=100000.0, funding=False):
+        lev=2.0, fee=0.001, cap=100000.0, funding=False, stop=None, k_up=0.75, k_dn=1.25):
     o, h, l, c = (d[k].to_numpy() for k in ['open', 'high', 'low', 'close'])
     t, fund = d.time.to_numpy(), d.fund.to_numpy()
-    sma720, band = indicators(d)
+    sma720, band = indicators(d, k_up=k_up, k_dn=k_dn)
     ent = cross_over(c, band)
     xs = cross_under(c, pd.Series(c).rolling(exit_len).mean().to_numpy())
     if either:
@@ -85,7 +85,7 @@ def run(d, tp=None, exit_len=720, either=False, start=None, end=None,
     lo = 0 if start is None else int(np.searchsorted(t, start))
     hi = n if end is None else int(np.searchsorted(t, end))
     cash, qty, avg = cap, 0.0, 0.0
-    tp_px = np.nan
+    tp_px = sl_px = np.nan
     pend_entry = pend_exit = False
     funding_paid = 0.0
     eq_close = np.empty(hi - lo); eq_low = np.empty(hi - lo)
@@ -96,7 +96,7 @@ def run(d, tp=None, exit_len=720, either=False, start=None, end=None,
             cash += qty * o[i] * (1 - fee)
             cur.update(exit_t=t[i], exit_px=o[i], reason='SMA')
             cur['pnl'] = cash - cur['eq0']; trades.append(cur); cur = None
-            qty = 0.0; tp_px = np.nan
+            qty = 0.0; tp_px = sl_px = np.nan
         if pend_entry and qty == 0:
             qty = pend_entry
             avg = o[i]
@@ -112,19 +112,28 @@ def run(d, tp=None, exit_len=720, either=False, start=None, end=None,
             funding_paid += fcost; cur['fund'] += fcost
             if funding:
                 cash -= fcost
-        # 3) 장중 익절 지정가 (체결 봉 다음 봉부터)
+        # 3a) 장중 고정 % 손절 (체결 봉 다음 봉부터, 같은 봉에서 익절과 겹치면 손절 우선)
+        if qty > 0 and not np.isnan(sl_px) and l[i] <= sl_px:
+            px = min(o[i], sl_px)
+            cash += qty * px * (1 - fee)
+            cur.update(exit_t=t[i], exit_px=px, reason='STOP')
+            cur['pnl'] = cash - cur['eq0']; trades.append(cur); cur = None
+            qty = 0.0; tp_px = sl_px = np.nan
+        # 3b) 장중 익절 지정가 (체결 봉 다음 봉부터)
         if qty > 0 and not np.isnan(tp_px) and h[i] >= tp_px:
             px = max(o[i], tp_px)
             cash += qty * px * (1 - fee)
             cur.update(exit_t=t[i], exit_px=px, reason='TP')
             cur['pnl'] = cash - cur['eq0']; trades.append(cur); cur = None
-            qty = 0.0; tp_px = np.nan
+            qty = 0.0; tp_px = sl_px = np.nan
         eq_close[j] = cash + qty * c[i]
         eq_low[j] = cash + qty * l[i]
         # 4) 종가 확정: 신호 판정
         if qty > 0:
             if tp is not None and np.isnan(tp_px):
                 tp_px = avg * (1 + tp)
+            if stop is not None and np.isnan(sl_px):
+                sl_px = avg * (1 - stop)
             if xs[i]:
                 pend_exit = True
         elif ent[i] and i + 1 < hi:
