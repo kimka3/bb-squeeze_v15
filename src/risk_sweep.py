@@ -3,13 +3,14 @@ from dataclasses import asdict
 import argparse,json
 import numpy as np
 import pandas as pd
-from run_frontier import ROOT,market_data,save_case,jobs_for,write_csv_atomic
+from run_frontier import ROOT,RESULTS,market_data,save_case,jobs_for,write_csv_atomic
 from frontier_engine import Strategy,run
 from data_io import START,END
 from analyze_results import period,SPLIT
 
-RESULTS=ROOT/'results'
 RISK_LEVELS=[.02]
+# The END the reference/ artifacts were produced with (2026-09-01).
+REFERENCE_END=1788220800000
 MODELS={'binance':(.0005,.0002),'zero_fee':(0.,.0002),
         'binance_slip5':(.0005,.0005),'zero_fee_slip5':(0.,.0005)}
 
@@ -112,10 +113,21 @@ def analyze():
            'cagr_per_absolute_mdd','clipped_entries','skipped_cap','average_requested_risk_pct','average_filled_risk_pct',
            'average_filled_fraction','average_open_initial_risk_pct','avg_gross_leverage','max_gross_at_4h_close','fraction_4h_above_1x']})
         summary[-1].update(later_cagr_pct=r['validation']['cagr_pct'],later_mdd_pct=r['validation']['mdd_pct'])
-    for model in ['binance','zero_fee','binance_slip5','zero_fee_slip5']:
-        reference=json.loads((ROOT/f'reference/{model}_risk200.json').read_text())
-        for k in ['cagr_pct','mdd_5m_close_pct','final_equity','trades','fees','funding_pnl']:
-            assert np.isclose(details[model+'_cap4_risk200'][k],reference[k],rtol=1e-10,atol=1e-8)
+    # reference/ holds the audited A results, frozen at the END they were produced
+    # with. They are a regression guard on the engine, not on the sample: over a
+    # longer sample they SHOULD differ, so comparing anyway would turn every
+    # extension into a failure and train us to delete the check. Compare only at
+    # that END, and say plainly when it is skipped.
+    if END==REFERENCE_END:
+        for model in ['binance','zero_fee','binance_slip5','zero_fee_slip5']:
+            reference=json.loads((ROOT/f'reference/{model}_risk200.json').read_text())
+            for k in ['cagr_pct','mdd_5m_close_pct','final_equity','trades','fees','funding_pnl']:
+                assert np.isclose(details[model+'_cap4_risk200'][k],reference[k],rtol=1e-10,atol=1e-8)
+        print('reference 대조 통과 (감사된 END와 동일)')
+    else:
+        print(f'reference 대조 건너뜀: END {END} != 감사된 {REFERENCE_END}. '
+              '표본이 길어졌으므로 수치가 달라지는 것이 정상이다.')
+        print('엔진 회귀를 확인하려면 END를 감사된 값으로 되돌려 돌릴 것.')
     write_csv_atomic(pd.DataFrame(summary),RESULTS/'risk_comparison.csv')
     write_csv_atomic(pd.DataFrame(years),RESULTS/'annual_results.csv')
     write_csv_atomic(pd.DataFrame(allocations),RESULTS/'symbol_allocation.csv')

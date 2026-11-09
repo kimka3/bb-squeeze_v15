@@ -2,6 +2,7 @@
 
 No orders. Sparse execution-data discovery is not publishable performance.
 """
+import os
 from pathlib import Path
 from dataclasses import replace,asdict
 import argparse,json,pickle,os
@@ -13,6 +14,10 @@ from equity_replay import equity_5m
 from analyze_results import period,monthly,SPLIT
 
 ROOT=Path(__file__).resolve().parents[1]
+# Where cases are written. Overridable because the artifacts under results/ were
+# audited at one END; re-running over a longer sample would otherwise overwrite
+# them in place and there would be nothing left to compare against.
+RESULTS=Path(os.environ.get('BB_RESULTS_DIR') or ROOT/'results')
 
 def cases(stage2=False):
     b=Strategy(name='v15_baseline')
@@ -124,7 +129,7 @@ def execute(discover=False,selected=None,model='binance',stage2=False):
             r=run(m,cfg);needed|=r['active_bars']-set(m.micro)
             print(model,cfg.name,'discovery only; missing',r['stats']['coarse_position_bars'],flush=True)
         else:
-            r,row,missing=save_case(m,cfg,ROOT/'results'/model/cfg.name)
+            r,row,missing=save_case(m,cfg,RESULTS/model/cfg.name)
             needed|=missing
             if row is None:print('BLOCKED',model,cfg.name,len(missing),flush=True)
             else:

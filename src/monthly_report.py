@@ -15,8 +15,18 @@ import pandas as pd
 from data_io import START,END
 
 ROOT=Path(__file__).resolve().parents[1]
-RESULTS=ROOT/'results'
-GRID=pd.period_range('2021-01','2026-08',freq='M')
+from run_frontier import RESULTS
+# The grid ends in the month that owns END. equity_replay stamps each row at the
+# END of its 5m interval, so END itself belongs to the previous instant's month —
+# hence END-1. Derived rather than written down: a hardcoded last month silently
+# drops every bar past it, which reads as a chain-link mismatch much later.
+LAST_MONTH=pd.Timestamp(END-1,unit='ms',tz='UTC').tz_convert(None).to_period('M')
+GRID=pd.period_range('2021-01',LAST_MONTH,freq='M')
+# True when END is not a month boundary, so the last row covers part of a month
+# and its return is not comparable with the others.
+PARTIAL_LAST=pd.Timestamp(END,unit='ms',tz='UTC')!=(
+    pd.Timestamp(END-1,unit='ms',tz='UTC').normalize().replace(day=1)
+    +pd.offsets.MonthBegin(1))
 
 def monthly(equity):
     """Month-end return, intramonth MDD and all-time underwater per month."""
@@ -65,7 +75,7 @@ def build():
         assert np.isclose(compounded,metrics['final_equity'],rtol=1e-9),folder.name
         assert np.isclose(table.worst_underwater_pct.min(),metrics['mdd_5m_close_pct'],atol=1e-8),folder.name
         assert np.isclose(table.equity_end.iloc[-1],metrics['final_equity'],rtol=1e-10),folder.name
-        assert len(table)==68 and table.intramonth_mdd_pct.max()<=0
+        assert len(table)==len(GRID) and table.intramonth_mdd_pct.max()<=0
         table.insert(0,'name',folder.name)
         table.insert(1,'model',metrics['model'])
         table.insert(2,'total_risk_cap_pct',round(metrics['config']['total_risk']*100))

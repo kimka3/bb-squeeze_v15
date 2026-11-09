@@ -9,7 +9,12 @@ SYMBOLS=['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','ADAUSDT',
 LONGS=SYMBOLS[:3]
 H4=14400000
 START=int(pd.Timestamp('2021-01-01',tz='UTC').timestamp()*1000)
-END=int(pd.Timestamp('2026-09-01',tz='UTC').timestamp()*1000)
+# Extended 2026-11-09 from 2026-09-01 (=1788220800000, the END the committed
+# results/cases artifacts were produced with). Appending bars does not disturb
+# history: every indicator is a backward-looking rolling window, verified by
+# recomputing all 11 symbols both ways and diffing the 12,780 overlapping bars
+# to exactly 0. Must sit on a 4h boundary with every bar before it closed.
+END=int(pd.Timestamp('2026-11-09 20:00',tz='UTC').timestamp()*1000)
 
 def records(path,symbol,suffix):
     rows=[]

@@ -18,7 +18,9 @@ def period(e,start,end):
 def monthly(e):
     x=e.copy();x['time']=pd.to_datetime(x.time_ms,unit='ms',utc=True)
     s=x.set_index('time').equity.resample('ME').last()
-    idx=pd.date_range('2021-01-31','2026-08-31',freq='ME',tz='UTC')
+    # Month ends up to the month that owns END (see monthly_report.GRID).
+    idx=pd.date_range('2021-01-31',pd.Timestamp(END-1,unit='ms',tz='UTC'),
+                      freq='ME',tz='UTC')
     s=s.reindex(idx).ffill().fillna(100000.)
     return np.log(s.to_numpy()/np.r_[100000.,s.to_numpy()[:-1]])
 
