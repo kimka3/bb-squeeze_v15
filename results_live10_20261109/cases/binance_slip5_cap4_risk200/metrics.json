@@ -62,6 +62,16 @@
     "return_pct": 177.4551882041046
   },
   "model": "binance_slip5_cap4",
+  "base_risk_pct": 2.0,
+  "bull_short_risk_pct": 1.0,
+  "clipped_entries": 96,
+  "average_requested_risk_pct": 1.816831683168317,
+  "average_filled_risk_pct": 1.737646087346531,
+  "average_filled_fraction": 0.9603990233314806,
+  "average_open_initial_risk_pct": 0.3310741603562868,
+  "max_open_initial_risk_at_4h_close_pct": 4.164398392554292,
+  "max_gross_at_4h_close": 5.096268604800616,
+  "fraction_4h_above_1x": 0.07496298605158576,
   "universe": [
     "BTCUSDT",
     "ETHUSDT",
