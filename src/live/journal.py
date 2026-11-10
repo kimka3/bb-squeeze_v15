@@ -1,4 +1,4 @@
-"""Append-only event journal. Current state is whatever replaying it produces.
+"""Append-only audit journal plus an atomic, durable recovery snapshot.
 
 Every decision and every exchange call is recorded before and after it happens,
 so a bot that dies mid-allocation can be told on restart exactly how far it got.
@@ -18,9 +18,8 @@ CLIENT_ORDER_MODULO = 2 ** 62
 def client_order_index(bar_ms: int, symbol: str, purpose: str, seq: int = 0) -> int:
     """Deterministic idempotency key.
 
-    A retry of the same intent produces the same id, so a request that actually
-    landed before the connection dropped is rejected as a duplicate instead of
-    doubling the position.
+    A retry of the same intent produces the same id. This identifies the intent;
+    it does not by itself establish an exchange's duplicate-submission semantics.
     """
     raw = f'{bar_ms}:{symbol}:{purpose}:{seq}'.encode()
     return int.from_bytes(hashlib.sha256(raw).digest()[:8], 'big') % CLIENT_ORDER_MODULO
@@ -56,13 +55,23 @@ class Journal:
 
     def save_snapshot(self, state: dict) -> None:
         tmp = self.snapshot_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(state, indent=2, default=str))
+        with tmp.open('w', encoding='utf-8') as fh:
+            json.dump(state, fh, indent=2, default=str, allow_nan=False)
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(self.snapshot_path)
+        # Persist the replacement directory entry on filesystems that support it.
+        if os.name != 'nt':
+            fd = os.open(self.dir, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     def load_snapshot(self) -> dict:
         if not self.snapshot_path.exists():
             return {'positions': {}, 'setups': {}, 'pending': {}, 'orders': {}, 'last_bar_ms': 0}
-        return json.loads(self.snapshot_path.read_text())
+        return json.loads(self.snapshot_path.read_text(encoding='utf-8'))
 
     def completed_intents(self, bar_ms: int) -> set[str]:
         """Intent ids already acknowledged for this bar — used to resume a bar

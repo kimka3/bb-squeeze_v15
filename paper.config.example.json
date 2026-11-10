@@ -1,0 +1,15 @@
+{
+  "_note": "All fills are simulated. No API keys or exchange balance are needed. Operational defaults are proposals, not handoff performance facts.",
+  "mode": "paper",
+  "state_dir": "paper_runs/manual/state",
+  "base_url": "https://mainnet.zklighter.elliot.ai",
+  "binance_base_url": "https://fapi.binance.com",
+  "paper_equity": 100000.0,
+  "poll_seconds": 60,
+  "bar_grace_seconds": 60,
+  "observation_seconds": 900,
+  "observation_notional_multiple": 0.86,
+  "passive_take_profit": true,
+  "passive_fill_model": "crossed_depth",
+  "breakeven_on_fill": true
+}
