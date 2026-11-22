@@ -1,0 +1,79 @@
+[
+  {
+    "symbol": "ADAUSDT",
+    "startTime": 1713038400000,
+    "endTime": 1713052799999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "ADAUSDT",
+    "startTime": 1740441600000,
+    "endTime": 1740455999999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "BNBUSDT",
+    "startTime": 1781841600000,
+    "endTime": 1781927999999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "BTCUSDT",
+    "startTime": 1642809600000,
+    "endTime": 1642967999999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "BTCUSDT",
+    "startTime": 1677830400000,
+    "endTime": 1678103999999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "BTCUSDT",
+    "startTime": 1740470400000,
+    "endTime": 1740513599999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "DOGEUSDT",
+    "startTime": 1678392000000,
+    "endTime": 1678492799999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "DOGEUSDT",
+    "startTime": 1684944000000,
+    "endTime": 1684958399999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "LINKUSDT",
+    "startTime": 1683576000000,
+    "endTime": 1683590399999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "XRPUSDT",
+    "startTime": 1642737600000,
+    "endTime": 1642809599999,
+    "interval": "5m",
+    "limit": 1500
+  },
+  {
+    "symbol": "XRPUSDT",
+    "startTime": 1740470400000,
+    "endTime": 1740484799999,
+    "interval": "5m",
+    "limit": 1500
+  }
+]
