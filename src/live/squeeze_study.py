@@ -9,10 +9,13 @@ indicators are computed once and only the squeeze is recomputed per setting.
 
     python src/live/squeeze_study.py
 
-Findings (data to 2026-11-22): loosening the ATR threshold or the bar count
-hurts; loosening only the BB-width threshold to 25-40% helps in both halves,
-5 of 6 years and in 6/10/11-symbol universes, but leaves the 2026-10/11
-episode unchanged (7 shorts, -6.8R). No setting tested made money there.
+Findings (data to 2026-11-22, every ambiguous 4h bar resolved on 5m):
+loosening the ATR threshold or the bar count sometimes raises CAGR but deepens
+the drawdown more, so CAGR/MDD is highest at ATR 0.30 / 3 bars for every BB
+width tested. Loosening only the BB-width threshold to 25-40% helps in both
+halves, in 4-5 of 6 years and in the 6/10/11-symbol universes, but leaves the
+2026-10/11 episode unchanged (7 shorts, -6.8R). None of the 36 grid settings
+made money in that episode.
 """
 import itertools
 import json
