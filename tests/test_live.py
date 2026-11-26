@@ -314,26 +314,15 @@ class PaperTriggers(unittest.TestCase):
 
     def _broker(self, tmp, **kw):
         from live.paper import PaperBroker, PaperPosition
-        b = PaperBroker.__new__(PaperBroker)          # no network in unit tests
-        b.base_url = 'http://unused'
-        b.markets = fake_markets()
-        b.state_path = Path(tmp) / 'paper.json'
-        b.cash = 100_000.
-        b.book = {}
-        b.fills = []
-        b.breakeven_on_fill = kw.get('breakeven_on_fill', True)
-        b.passive_take_profit = kw.get('passive_take_profit', False)
-        b.funding_rate_is_percent = True
-        b._owner = {}
-        b._next_index = 1
-        b._marks = {}
-        b._last_funding_hour = 10 ** 9                # funding already settled
-        b._quote = lambda symbol, qty, buying: _FakeQuote(qty)
+        b = PaperBroker('http://unused', fake_markets(), Path(tmp) / 'paper.json',
+                        breakeven_on_fill=kw.get('breakeven_on_fill', True),
+                        passive_take_profit=kw.get('passive_take_profit', False))
+        b._quote = lambda symbol, qty, buying, **options: _FakeQuote(qty)
         b.refresh_marks = lambda: b._marks
         b._accrue_funding = lambda marks: None
         b.save = lambda: None
         b.book['ETHUSDT'] = PaperPosition(side='SHORT', entry=100., qty=10.,
-                                          initial_qty=10., stop=104., tp=96.)
+                                          initial_qty=10., stop=104., tp=96., tp_qty=5.)
         return b
 
     def test_short_stop_fires_when_mark_crosses_up(self):
@@ -406,29 +395,19 @@ class PassiveTakeProfit(unittest.TestCase):
 
     def _broker(self, tmp, **kw):
         from live.paper import PaperBroker, PaperPosition
-        b = PaperBroker.__new__(PaperBroker)
-        b.base_url = 'http://unused'
-        b.markets = fake_markets()
-        b.state_path = Path(tmp) / 'paper.json'
-        b.cash = 100_000.
-        b.book = {}
-        b.fills = []
-        b.breakeven_on_fill = True
-        b.passive_take_profit = kw.get('passive_take_profit', True)
-        b.funding_rate_is_percent = True
-        b._owner = {}
-        b._next_index = 1
-        b._marks = {}
-        b._last_funding_hour = 10 ** 9
-        b._quote = lambda symbol, qty, buying: _FakeQuote(qty, vwap=95.5)
+        b = PaperBroker('http://unused', fake_markets(), Path(tmp) / 'paper.json',
+                        passive_take_profit=kw.get('passive_take_profit', True))
+        # A visible ask strictly through the short's buy limit provides only a
+        # simulation opportunity; this does not pretend to observe maker fills.
+        b._quote = lambda symbol, qty, buying, **options: _FakeQuote(qty, vwap=95.5)
         b.refresh_marks = lambda: b._marks
         b._accrue_funding = lambda marks: None
         b.save = lambda: None
         b.book['ETHUSDT'] = PaperPosition(side='SHORT', entry=100., qty=10.,
-                                          initial_qty=10., stop=104., tp=96.)
+                                          initial_qty=10., stop=104., tp=96., tp_qty=5.)
         return b
 
-    def test_resting_take_profit_fills_at_its_own_price(self):
+    def test_crossed_depth_maker_model_books_at_its_limit(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             b = self._broker(tmp)
@@ -437,6 +416,8 @@ class PassiveTakeProfit(unittest.TestCase):
             self.assertEqual(fill.role, 'TP2R')
             self.assertEqual(fill.price, 96., 'a maker order fills at its own limit')
             self.assertEqual(fill.slippage_bps, 0.0, 'and pays no spread')
+            self.assertEqual(fill.evidence, 'SIMULATED')
+            self.assertEqual(fill.fill_model, 'crossed_depth_limit')
 
     def test_crossing_take_profit_pays_the_book(self):
         import tempfile
@@ -457,17 +438,17 @@ class PassiveTakeProfit(unittest.TestCase):
             trader.positions['ETHUSDT'] = {'side': 'SHORT', 'qty': 10., 'initial_qty': 10.,
                                            'stop': 104., 'entry': 100.,
                                            'partial_taken': False, 'bars': 1}
-            sliver = AccountState(equity=1e5, maintenance_margin=1.,
+            sliver = AccountState(equity=1e5, maintenance_margin=1., execution_changes_verified=True,
                                   positions={'ETH': {'side': 'SHORT', 'qty': 9.,
-                                                     'entry': 100.}})
+                                                     'entry': 100., 'partial_taken': False}})
             trader._sync_fills(sliver)
             p = trader.positions['ETHUSDT']
             self.assertFalse(p['partial_taken'], '10% of the leg is not the leg')
             self.assertEqual(p['stop'], 104., 'stop must not tighten yet')
 
-            done = AccountState(equity=1e5, maintenance_margin=1.,
+            done = AccountState(equity=1e5, maintenance_margin=1., execution_changes_verified=True,
                                 positions={'ETH': {'side': 'SHORT', 'qty': 5.,
-                                                   'entry': 100.}})
+                                                   'entry': 100., 'partial_taken': True}})
             trader._sync_fills(done)
             p = trader.positions['ETHUSDT']
             self.assertTrue(p['partial_taken'])
@@ -547,8 +528,8 @@ class MultiWeekRun(unittest.TestCase):
 
         restricted = [u for u in calls if 'fapi.binance.com' in u]
         self.assertEqual(len(restricted), 1, 'the 451 host was retried')
-        self.assertTrue(any('www.binance.com' in u for u in calls),
-                        'the fallback host was never tried')
+        self.assertFalse(any('www.binance.com' in u for u in calls),
+                         'policy denial must not trigger undocumented host routing')
 
     def test_flake_is_retried_on_the_same_host(self):
         from live import feed
@@ -592,7 +573,10 @@ class MultiWeekRun(unittest.TestCase):
         report a placeholder zero that reads like a wiped account."""
         cfg = LiveConfig()
         broker = DryRunBroker()
-        trader = Trader(cfg, broker, fake_markets(), Journal(Path('/tmp')))
+        import tempfile
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        trader = Trader(cfg, broker, fake_markets(), Journal(Path(temp.name)))
         trader.last_bar_ms = START + 10 * H4
 
         out = trader.on_bar(START + 10 * H4, {}, {})

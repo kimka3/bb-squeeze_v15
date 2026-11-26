@@ -102,5 +102,10 @@ def marks(base_url: str, markets: dict[str, Market]) -> dict[str, float]:
     does any stop we are about to place, since Lighter triggers on mark."""
     details = {d['symbol']: d for d in
                _get(f'{base_url}/api/v1/orderBookDetails')['order_book_details']}
-    return {s: float(details[m.symbol]['mark_price'])
-            for s, m in markets.items() if m.symbol in details}
+    result = {s: float(details[m.symbol]['mark_price'])
+              for s, m in markets.items() if m.symbol in details}
+    missing = set(markets) - set(result)
+    invalid = [s for s, price in result.items() if not math.isfinite(price) or price <= 0]
+    if missing or invalid:
+        raise RuntimeError(f'incomplete/invalid Lighter marks: missing={sorted(missing)}, invalid={invalid}')
+    return result

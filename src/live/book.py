@@ -11,6 +11,7 @@ charged for the size the strategy actually wanted.
 from __future__ import annotations
 
 import json
+import math
 import urllib.request
 from dataclasses import dataclass
 
@@ -56,10 +57,12 @@ def _levels(depth: dict, buying: bool) -> list[tuple[float, float]]:
     for o in rows:
         try:
             price = float(o['price'])
-            size = float(o.get('remaining_base_amount') or o.get('initial_base_amount') or 0)
+            # A consumed order's explicit zero remaining quantity is NOT its
+            # initial size. Falling back via `or` resurrects exhausted depth.
+            size = float(o.get('remaining_base_amount', o.get('initial_base_amount', 0)))
         except (KeyError, TypeError, ValueError):
             continue
-        if price > 0 and size > 0:
+        if math.isfinite(price) and math.isfinite(size) and price > 0 and size > 0:
             out.append((price, size))
     # The API returns best-first already; sort defensively so a change in that
     # contract degrades into a worse quote rather than a wrong one.
@@ -69,6 +72,8 @@ def _levels(depth: dict, buying: bool) -> list[tuple[float, float]]:
 
 def walk(depth: dict, qty: float, buying: bool) -> Quote:
     """Consume resting orders until `qty` is filled, or the visible book ends."""
+    if not math.isfinite(qty) or qty < 0:
+        raise ValueError('book quantity must be finite and nonnegative')
     levels = _levels(depth, buying)
     if not levels or qty <= 0:
         return Quote(float('nan'), 0., qty, float('nan'), float('nan'), True)

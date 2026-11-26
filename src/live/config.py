@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from frontier_engine import Strategy
 
@@ -70,6 +72,15 @@ class LiveConfig:
     # Execution. Only the take-profit leg is worth making passive — see
     # src/live/execution_study.py. Entries and stops must cross the book.
     passive_take_profit: bool = True
+    passive_fill_model: str = 'crossed_depth'  # simulation, never an observed maker fill
+    paper_equity: float = 100_000.0
+    # Operational defaults, not historical performance measurements.
+    observation_seconds: int = 900
+    observation_notional_multiple: float = .86
+    binance_base_url: str = 'https://fapi.binance.com'
+    request_timeout_seconds: int = 10
+    feed_retries: int = 2
+    max_clock_skew_seconds: float = 5.0
 
     # Guards
     margin_ratio_block_entries: float = 3.0   # equity / maintenance margin
@@ -84,6 +95,8 @@ class LiveConfig:
         if self.mode not in MODES:
             raise ValueError(f'mode must be one of {MODES}')
         self.universe = tuple(self.universe)
+        if not self.universe or len(set(self.universe)) != len(self.universe):
+            raise ValueError('universe must be non-empty and have no duplicate symbols')
         unknown = [s for s in self.universe if s not in SYMBOL_TO_LIGHTER]
         if unknown:
             raise ValueError(f'universe has symbols with no Lighter market: {unknown}')
@@ -92,6 +105,20 @@ class LiveConfig:
             # optional; having its bars is not.
             raise ValueError('BTCUSDT must stay in the universe: the regime filter reads it')
         self.state_dir = Path(self.state_dir)
+        for name in ('base_url', 'binance_base_url'):
+            url = urlsplit(getattr(self, name))
+            if (url.scheme != 'https' or not url.hostname or url.username or
+                    url.password or url.query or url.fragment or url.path not in ('', '/')):
+                raise ValueError(f'{name} must be an HTTPS origin without credentials')
+            setattr(self, name, getattr(self, name).rstrip('/'))
+        for name in ('poll_seconds', 'bar_grace_seconds', 'paper_equity',
+                     'observation_seconds', 'observation_notional_multiple',
+                     'request_timeout_seconds', 'feed_retries', 'max_clock_skew_seconds'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be finite and positive')
+        if self.passive_fill_model not in ('crossed_depth', 'observe_only'):
+            raise ValueError('passive_fill_model must be crossed_depth or observe_only')
         if self.mode == 'live' and self.account_index is None:
             raise ValueError('live mode requires account_index')
 
@@ -112,7 +139,9 @@ class LiveConfig:
     def load(cls, path: str | Path | None = None, **overrides) -> 'LiveConfig':
         data = {}
         if path:
-            data = json.loads(Path(path).read_text())
+            data = json.loads(Path(path).read_text(encoding='utf-8'))
+            # Human annotations are allowed; all other unknown keys still fail.
+            data = {k: v for k, v in data.items() if not k.startswith('_')}
             if 'strategy' in data:
                 data['strategy'] = Strategy(**data['strategy'])
         data.update(overrides)
